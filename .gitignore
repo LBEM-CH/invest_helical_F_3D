@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+temp.tbl
+remove_list.txt
+*.tmp
