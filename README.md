@@ -87,32 +87,35 @@ Dependencies (both methods below install all of them):
 | RELION | eulerangles | `--relion` (RELION→Dynamo pose conversion) |
 | 3D view | PyOpenGL, mrcfile | the per-filament "View 3D" (OpenGL + reading the map) |
 
-### Recommended: conda (self-contained, no root)
+**PyQt6 comes from PyPI** (conda-forge ships only PyQt5), so the GUI stack is `pip`-installed
+on every route — including inside the conda env.
 
-PyQt6 from PyPI needs the system library `libxcb-cursor0` at runtime (and the 3D view needs
-system OpenGL), which are often missing on clusters where you can't `sudo apt install` them.
-The conda-forge packages bundle `libxcb-cursor` and a working OpenGL/Mesa stack, so the
-environment is fully self-contained — the right install path for a shared / no-sudo machine.
+### Simplest: pip (macOS, Windows, Linux-with-libs)
 
 ```bash
-cd ~/LBEM/invest_helical_F_3D
-conda env create -f environment.yml     # creates env "invest_helical" with everything
-conda activate invest_helical
-```
-
-### Alternative: pip venv
-
-Lean, but relies on system libraries being present (`libxcb-cursor0` for PyQt6 ≥ 6.5, and
-`libGL`/GLX for the 3D view):
-
-```bash
-cd ~/LBEM/invest_helical_F_3D
+cd invest_helical_F_3D
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt          # core + eulerangles + PyOpenGL + mrcfile
+pip install -r requirements.txt          # PyQt6 + pyqtgraph + scipy/numpy + eulerangles + PyOpenGL + mrcfile
 ```
 
-If launching fails with *"xcb-cursor0 or libxcb-cursor0 is needed to load the Qt xcb
+On **macOS** (incl. Apple Silicon) and Windows this just works — native windowing + OpenGL,
+no extra system libraries. On Linux it relies on `libxcb-cursor0` (PyQt6 ≥ 6.5) and
+`libGL`/GLX being present — see the fallback below if launching errors out.
+
+### Linux, no root: conda for the system libraries
+
+On a shared Linux cluster where you can't `sudo apt install`, let conda supply the missing
+system libraries (the Qt binding still comes via pip per `environment.yml`):
+
+```bash
+cd ~/LBEM/invest_helical_F_3D
+conda env create -f environment.yml             # python + numpy/scipy (conda), Qt stack (pip)
+conda activate invest_helical
+conda install -c conda-forge xcb-util-cursor    # provides libxcb-cursor.so.0 (Linux only)
+```
+
+If a pip-venv launch fails with *"xcb-cursor0 or libxcb-cursor0 is needed to load the Qt xcb
 platform plugin"*, either `sudo apt install libxcb-cursor0` (one-time, all users), or — with
 no root — drop the single library into your home dir and point `LD_LIBRARY_PATH` at it:
 
@@ -122,9 +125,9 @@ mkdir -p ~/.local/lib && cp x/usr/lib/*/libxcb-cursor.so.0* ~/.local/lib/
 export LD_LIBRARY_PATH=$HOME/.local/lib:$LD_LIBRARY_PATH
 ```
 
-The bundled `run.sh` sets that `LD_LIBRARY_PATH` for you and runs the venv Python. The 2D app
-needs none of this — the 3D extras (PyOpenGL, mrcfile, OpenGL libs) are only touched when you
-click **View 3D**, so a missing OpenGL stack never blocks 2D triage.
+The bundled `run.sh` sets that `LD_LIBRARY_PATH` for you and runs the venv Python. None of this
+applies on macOS/Windows. The 2D app needs no OpenGL — the 3D extras are only touched when you
+click **View 3D** — so a missing OpenGL stack never blocks 2D triage.
 
 ## Run
 

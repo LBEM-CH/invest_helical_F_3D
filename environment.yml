@@ -1,22 +1,27 @@
-# Self-contained conda environment for invest_helical_F_3D.
-# conda-forge's pyqt pulls in xcb-util-cursor (libxcb-cursor.so.0) and the rest
-# of the X/xcb system libraries, so the GUI runs with no root and no system
-# packages -- the right install path for a shared / no-sudo cluster.
+# Cross-platform conda environment for invest_helical_F_3D.
+#
+# conda-forge ships only PyQt5, so the Qt / GUI stack is installed via pip (PyPI
+# has PyQt6 wheels for Linux and macOS, incl. Apple Silicon). conda just manages
+# the Python interpreter + numpy/scipy here.
 #
 #   conda env create -f environment.yml
 #   conda activate invest_helical
+#
+# Linux on a no-sudo cluster: also run
+#   conda install -c conda-forge xcb-util-cursor
+# so PyQt6's xcb plugin finds libxcb-cursor.so.0 (not needed on macOS/Windows).
 #
 name: invest_helical
 channels:
   - conda-forge
 dependencies:
   - python=3.11
-  - pyqt>=6.5
-  - pyqtgraph>=0.13
   - numpy>=1.20
   - scipy>=1.7
-  - pyopengl>=3.1        # in-app 3D view ("View 3D")
-  - mrcfile>=1.4         # 3D view density overlay (.mrc maps)
   - pip
   - pip:
-      - eulerangles>=1.0   # pip-only; pure-python, needed only for --relion
+      - PyQt6>=6.5         # conda-forge has no PyQt6 -> from PyPI
+      - pyqtgraph>=0.13
+      - PyOpenGL>=3.1      # in-app 3D view
+      - mrcfile>=1.4       # 3D density overlay
+      - eulerangles>=1.0   # RELION pose conversion (--relion)
