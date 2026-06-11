@@ -191,6 +191,17 @@ def main(argv=None):
         del os.environ["QT_XCB_GL_INTEGRATION"]        # --gl overrides a stale 'none'
 
     pg.setConfigOptions(antialias=False, useOpenGL=False, background="w", foreground="k")
+
+    # Every View-3D window is its own GLViewWidget with its own GL context, but
+    # pyqtgraph caches each compiled shader program's GL id globally. Opening a
+    # second 3D window (e.g. another filament) would then glUseProgram() an id
+    # from the first window's context -> GLError 1281 (invalid value), spammed on
+    # every repaint. Sharing GL contexts app-wide makes those ids valid in every
+    # window. Must be set before the QApplication is constructed.
+    if gl_enabled:
+        from PyQt6 import QtCore
+        QtWidgets.QApplication.setAttribute(
+            QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QtWidgets.QApplication(sys.argv[:1])
 
     pixelsize = resolve_pixelsize(args, fmt)

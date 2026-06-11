@@ -172,9 +172,22 @@ def _build_dynamo(folder: str, tomo, write_temp: bool):
 
 
 # --- RELION --------------------------------------------------------------------
-def _build_relion(star_path: str, tomo):
+def relion_to_dynamo_table(d: dict) -> np.ndarray:
+    """Dynamo .tbl array from the relion-derived particle dict (single tomogram).
+
+    Thin wrapper over relion2dynamo.assemble_table so the GUI's temp.tbl and the
+    standalone relion2dynamo CLI always produce identical tables.
+    """
+    from relion2dynamo import assemble_table
+    return assemble_table(d["pid"], d["eulers"], d["tube"], d["xyz"])
+
+
+def _build_relion(star_path: str, tomo, write_temp: bool = True):
     from relion_star import load_particles
     tomo_name, d = load_particles(star_path, None if tomo is None else str(tomo))
+    if write_temp:
+        out = os.path.join(os.path.dirname(star_path) or ".", "temp.tbl")
+        np.savetxt(out, relion_to_dynamo_table(d), fmt="%g")
     filaments: list[Filament] = []
     for fid in np.unique(d["tube"]):
         sel = d["tube"] == fid
@@ -195,7 +208,7 @@ def load_dataset(source: str, fmt: str, tomo, twist: float, rise: float,
     write_temp: Dynamo only -- write temp.tbl (the working rows) into the folder.
     """
     if fmt == "relion":
-        tomo_id, n_seg, fils = _build_relion(source, tomo)
+        tomo_id, n_seg, fils = _build_relion(source, tomo, write_temp)
     elif fmt == "dynamo":
         tomo_id, n_seg, fils = _build_dynamo(source, tomo, write_temp)
     else:

@@ -35,6 +35,9 @@ _HORIZONTAL = QtCore.Qt.Orientation.Horizontal
 # axis -> RGBA for the pose triad (x red, y green, z blue)
 _AXIS_RGBA = np.array([[1, 0, 0, 1.], [0, 0.8, 0, 1.], [0.2, 0.4, 1, 1.]])
 _MARK_RGBA = (0.86, 0.12, 0.12, 1.0)
+# placed-density surface color (medium blue-grey: light but with enough body to
+# read against the white background under the built-in 'shaded' lighting)
+_MESH_RGBA = (0.55, 0.62, 0.78, 1.0)
 
 
 def _rotations(eulers: np.ndarray, invert: bool) -> Rot:
@@ -64,13 +67,23 @@ def pose_triads(xyz: np.ndarray, eulers: np.ndarray, length: float,
 def isosurface(volume: np.ndarray, level: float):
     """Marching-cubes isosurface (via pyqtgraph), centered on the box middle.
 
+    pyqtgraph returns vertices in array-index order (axis0, axis1, axis2), which
+    for an mrc/em volume is (z, y, x). We reverse them to physical (x, y, z) so
+    the pose rotation in place_meshes -- which is in tomogram x/y/z -- acts on the
+    right axes. Without this the map's z (helical) axis would be placed as if it
+    were x, so the density points along the wrong axis no matter the Euler pose.
+    Face winding is reversed as well to keep the surface normals pointing outward
+    after the axis swap.
+
     Returns (verts, faces) with verts in voxel units shifted so the box center
     is the origin -- ready to rotate about the particle center.
     """
     vol = np.ascontiguousarray(volume, dtype="float32")
     verts, faces = pg.isosurface(vol, float(level))
-    verts = verts - (np.array(vol.shape) - 1) / 2.0
-    return verts, faces
+    verts = verts[:, ::-1]                                  # (z,y,x) -> (x,y,z)
+    verts = verts - (np.array(vol.shape[::-1]) - 1) / 2.0   # center; shape -> (nx,ny,nz)
+    faces = faces[:, ::-1]                                  # outward winding after swap
+    return np.ascontiguousarray(verts), np.ascontiguousarray(faces)
 
 
 def place_meshes(verts: np.ndarray, faces: np.ndarray, xyz: np.ndarray,
@@ -112,7 +125,10 @@ class View3DWindow(QtWidgets.QMainWindow):
         self.ds = ds
         self.store = store
         self.volume = volume                       # (nz,ny,nx) float or None
-        self.scale = (map_voxel / ds.pixelsize) if (map_voxel and ds.pixelsize) else 1.0
+        # voxel size of the map (A/px); default to the tomogram pixel size so the
+        # density lands at 1:1 when the .mrc header has no usable voxel size.
+        self.map_voxel = float(map_voxel) if map_voxel else float(ds.pixelsize)
+        self.scale = 1.0                            # voxel -> tomogram-px (set below)
         self._iso = None                            # cached (verts, faces) for current level
         self.setWindowTitle(f"3D — filament {fil.fid}  (n={fil.n})")
         self.resize(1100, 820)
@@ -120,7 +136,8 @@ class View3DWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         lay = QtWidgets.QHBoxLayout(central)
-        lay.addWidget(self._build_controls())
+        lay.addWidget(self._build_controls())       # creates self.sp_voxel
+        self._recompute_scale()
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor("w")
         lay.addWidget(self.view, 1)
@@ -132,9 +149,14 @@ class View3DWindow(QtWidgets.QMainWindow):
                                                 width=1.0, antialias=True))
         self.glyphs = gl.GLLinePlotItem(mode="lines", width=2.0, antialias=True)
         self.view.addItem(self.glyphs)
+        # placed reference density: built-in 'shaded' lighting, medium blue-grey.
         self.mesh = gl.GLMeshItem(smooth=True, shader="shaded",
-                                  color=(0.3, 0.55, 0.95, 1.0))
+                                  color=_MESH_RGBA, glOptions="opaque")
         self.view.addItem(self.mesh)
+        # orange marker for the segment currently pointed at in the 2D detail window
+        self.hover = gl.GLScatterPlotItem(pos=np.zeros((0, 3)), size=18.0,
+                                          color=(1.0, 0.5, 0.0, 1.0), pxMode=True)
+        self.view.addItem(self.hover)
 
         self._center_camera()
         self.store.changed.connect(self._recolor)
@@ -163,6 +185,16 @@ class View3DWindow(QtWidgets.QMainWindow):
         self.btn_map.clicked.connect(self._load_map)
         v.addWidget(self.btn_map)
 
+        v.addWidget(QtWidgets.QLabel("map voxel size (Å/px)"))
+        self.sp_voxel = QtWidgets.QDoubleSpinBox()
+        self.sp_voxel.setRange(0.001, 1000.0)
+        self.sp_voxel.setDecimals(3)
+        self.sp_voxel.setSingleStep(0.01)
+        self.sp_voxel.setKeyboardTracking(False)
+        self.sp_voxel.setValue(self.map_voxel)
+        self.sp_voxel.valueChanged.connect(self._on_voxel_changed)
+        v.addWidget(self.sp_voxel)
+
         self.chk_density = QtWidgets.QCheckBox("Show density")
         self.chk_density.setEnabled(self.volume is not None)
         self.chk_density.toggled.connect(self._refresh)
@@ -178,7 +210,11 @@ class View3DWindow(QtWidgets.QMainWindow):
 
         v.addWidget(QtWidgets.QLabel("placement convention"))
         self.cb_conv = QtWidgets.QComboBox()
+        # With the volume axes decoded correctly (see isosurface), "as-is (D)" is
+        # the placement that matches ChimeraX: the map's z (helical) axis lands on
+        # the filament. "inverse (Dᵀ)" is the transpose, kept as an escape hatch.
         self.cb_conv.addItems(["pose: as-is (D)", "pose: inverse (Dᵀ)"])
+        self.cb_conv.setCurrentIndex(0)
         self.cb_conv.currentIndexChanged.connect(self._refresh)
         v.addWidget(self.cb_conv)
 
@@ -202,11 +238,38 @@ class View3DWindow(QtWidgets.QMainWindow):
         self.scatter.setData(color=cols)
 
     def _invert(self):
+        # index 0 = as-is D (default, ChimeraX-matching); index 1 = inverse Dᵀ
         return self.cb_conv.currentIndex() == 1
 
+    def _recompute_scale(self):
+        """voxel -> tomogram-px factor from the (possibly user-overridden) voxel size."""
+        vx = self.sp_voxel.value()
+        self.scale = (vx / self.ds.pixelsize) if self.ds.pixelsize else 1.0
+
+    def _on_voxel_changed(self):
+        self.map_voxel = self.sp_voxel.value()
+        self._recompute_scale()
+        self._refresh()
+
+    def highlight_tags(self, tags):
+        """Light up the given segment tags (orange) -- the live 2D->3D hover link."""
+        if tags is None or len(tags) == 0:
+            self.hover.setData(pos=np.zeros((0, 3)))
+            return
+        mask = np.isin(self.fil.tags, np.asarray(tags))
+        self.hover.setData(pos=self.fil.xyz[mask] if mask.any() else np.zeros((0, 3)))
+
     def _load_map(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Reference map", "", "Density maps (*.mrc *.map *.rec *.em);;All files (*)")
+        # Freeze GL repaints while the modal file dialog spins its own event loop;
+        # on macOS a repaint there hits a context whose shader programs aren't
+        # valid and PyOpenGL spams GLError 1281 (non-fatal, but noisy).
+        self.view.setUpdatesEnabled(False)
+        try:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Reference map", "",
+                "Density maps (*.mrc *.map *.rec *.em);;All files (*)")
+        finally:
+            self.view.setUpdatesEnabled(True)
         if not path:
             return
         from volume_io import read_volume
@@ -216,7 +279,11 @@ class View3DWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Load map", f"could not read map:\n{e}")
             return
         self.volume = vol
-        self.scale = (voxel / self.ds.pixelsize) if (voxel and self.ds.pixelsize) else 1.0
+        self.map_voxel = float(voxel) if voxel else float(self.ds.pixelsize)
+        self.sp_voxel.blockSignals(True)
+        self.sp_voxel.setValue(self.map_voxel)      # reflect the header voxel in the box
+        self.sp_voxel.blockSignals(False)
+        self._recompute_scale()
         self._iso = None
         self.chk_density.setEnabled(True)
         self.sl_iso.setEnabled(True)
@@ -226,6 +293,26 @@ class View3DWindow(QtWidgets.QMainWindow):
     def _on_iso_changed(self):
         self._iso = None                            # threshold changed -> recompute
         self._refresh()
+
+    def closeEvent(self, ev):
+        """Tear the GL scene down before the C++ widget dies.
+
+        On macOS a queued paintGL can fire while the window is closing, after the
+        GL context is gone, and PyOpenGL then raises GLError 1281 (invalid
+        program) from glUseProgram. Disabling updates, dropping the live store
+        connection, and removing the items first avoids that stray repaint.
+        """
+        try:
+            self.store.changed.disconnect(self._recolor)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.view.setUpdatesEnabled(False)
+            for it in list(self.view.items):
+                self.view.removeItem(it)
+        except Exception:                           # noqa: BLE001 - teardown is best-effort
+            pass
+        super().closeEvent(ev)
 
     def _refresh(self):
         f = self.fil
@@ -246,7 +333,8 @@ class View3DWindow(QtWidgets.QMainWindow):
             mv, mf = place_meshes(verts, faces, xyz, eul, self.scale, self._invert())
             self.mesh.setMeshData(vertexes=mv, faces=mf)
             self.mesh.setVisible(True)
-            info += f"  |  density: {len(xyz)} copies (stride {stride}), {len(mf):,} faces"
+            info += (f"  |  density: {len(xyz)} copies (stride {stride}), {len(mf):,} faces"
+                     f"  |  voxel {self.map_voxel:.3g} Å/px → scale {self.scale:.3g}")
         else:
             self.mesh.setVisible(False)
         self.lbl_info.setText(info)

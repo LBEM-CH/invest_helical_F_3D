@@ -162,6 +162,8 @@ class DetailWindow(QtWidgets.QMainWindow):
                                    volume=self.map_volume, map_voxel=self.map_voxel,
                                    parent=self)
         self.view3d.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        # drop our reference once it closes, so hover-linking stops touching it
+        self.view3d.destroyed.connect(lambda *_: setattr(self, "view3d", None))
         self.view3d.show()
 
     # --- interaction ---------------------------------------------------------
@@ -188,6 +190,8 @@ class DetailWindow(QtWidgets.QMainWindow):
         for p in self.panels:
             p.show_hover(idx)
         t = int(self.fil.tags[idx])
+        if self.view3d is not None:                # mirror the hover onto the 3D scene
+            self.view3d.highlight_tags([t])
         self.readout.setText(
             f"tag {t}   pos={self.fil.pos[idx]:+.1f}Å   "
             f"roll={self.fil.phi[idx]:+.1f}°   delta={self.fil.delta[idx]:+.1f}°"
