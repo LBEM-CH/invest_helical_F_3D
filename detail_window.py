@@ -12,7 +12,8 @@ Three linked plots for one filament:
 Pointing at a segment in any plot highlights the SAME segment in all three.
 Marking for removal: rubber-band drag (Select mode), the Select-all button, or
 clicking a single point toggles it. Marks restyle live across every plot and the
-overview, and are persisted by the SelectionStore.
+overview, and are persisted by the SelectionStore. The twist / rise / pixel-size
+bar retunes the model live and is kept in sync with the overview's bar.
 """
 
 from __future__ import annotations
@@ -23,8 +24,9 @@ from PyQt6 import QtCore, QtWidgets
 
 from dynamo_table import Filament
 from helix_geom import model_line
-from plot_common import HILITE_PEN, SelectableViewBox, pos_brushes
-from selection_store import SelectionStore
+from plot_common import HILITE_PEN, ModelParams, ParamBar, SelectableViewBox, pos_brushes
+
+_DASH = pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine)
 
 
 class _Panel:
@@ -54,7 +56,7 @@ class _Panel:
     def set_data(self, x, y, tags):
         self.x, self.y, self.tags = np.asarray(x), np.asarray(y), np.asarray(tags)
 
-    def restyle(self, store: SelectionStore):
+    def restyle(self, store):
         marked = np.array([store.is_marked(t) for t in self.tags], dtype=bool)
         brushes = pos_brushes(self.x, marked)
         spots = [dict(pos=(float(x), float(y)), data=int(t), brush=b,
@@ -77,13 +79,18 @@ class _Panel:
 
 class DetailWindow(QtWidgets.QMainWindow):
 
-    def __init__(self, fil: Filament, model_rate: float, pos_halfspan: float,
-                 store: SelectionStore, parent=None):
+    def __init__(self, fil: Filament, params: ModelParams, store,
+                 map_volume=None, map_voxel=None, gl_enabled=True, parent=None):
         super().__init__(parent)
         self.fil = fil
+        self.params = params
         self.store = store
+        self.map_volume = map_volume
+        self.map_voxel = map_voxel
+        self.gl_enabled = gl_enabled
+        self.view3d = None
         self.setWindowTitle(f"filament {fil.fid}  (n={fil.n})")
-        self.resize(1300, 520)
+        self.resize(1300, 560)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -99,10 +106,17 @@ class DetailWindow(QtWidgets.QMainWindow):
         self.btn_home.clicked.connect(self._reset_view)
         self.btn_back = QtWidgets.QPushButton("← Back to overview")
         self.btn_back.clicked.connect(self.close)
-        self.readout = QtWidgets.QLabel("hover a segment…")
-        self.readout.setMinimumWidth(360)
-        for w in (self.btn_all, self.btn_clear, self.btn_home, self.btn_back):
+        self.btn_3d = QtWidgets.QPushButton("View 3D")
+        self.btn_3d.clicked.connect(self._open_3d)
+        if not self.gl_enabled:
+            self.btn_3d.setEnabled(False)
+            self.btn_3d.setToolTip("OpenGL unavailable (typical over ssh -XY). "
+                                   "Run locally, or with --gl / VirtualGL, for the 3D view.")
+        for w in (self.btn_all, self.btn_clear, self.btn_home, self.btn_back, self.btn_3d):
             bar.addWidget(w)
+        bar.addWidget(ParamBar(params))
+        self.readout = QtWidgets.QLabel("hover a segment…")
+        self.readout.setMinimumWidth(340)
         bar.addWidget(self.readout)
         bar.addStretch(1)
         outer.addLayout(bar)
@@ -111,25 +125,18 @@ class DetailWindow(QtWidgets.QMainWindow):
         glw = pg.GraphicsLayoutWidget()
         outer.addWidget(glw, 1)
         self.p1 = _Panel(glw, 0, 0, f"fil {fil.fid}: roll vs position",
-                         "position along axis (px)", "roll (deg)")
+                         "position along axis (Å)", "roll (deg)")
         self.p2 = _Panel(glw, 0, 1, "residual to model",
-                         "position along axis (px)", "delta: data - model (deg)")
+                         "position along axis (Å)", "delta: data - model (deg)")
         self.p3 = _Panel(glw, 0, 2, "XY map", "X (px)", "Y (px)")
         self.panels = [self.p1, self.p2, self.p3]
 
-        self.p1.set_data(fil.pos, fil.phi, fil.tags)
-        self.p2.set_data(fil.pos, fil.delta, fil.tags)
-        self.p3.set_data(fil.xy[:, 0], fil.xy[:, 1], fil.tags)
         self.p2.plot.addLine(y=0, pen=pg.mkPen("k", style=QtCore.Qt.PenStyle.DashLine))
         self.p3.vb.setAspectLocked(True)
+        self.p3.set_data(fil.xy[:, 0], fil.xy[:, 1], fil.tags)
         self.p3.plot.plot(fil.xy[:, 0], fil.xy[:, 1],
                           pen=pg.mkPen((150, 150, 150), width=1))   # connecting line
-
-        # dashed screw model on plot1
-        if fil.n >= 5 and np.isfinite(fil.phi0):
-            xx, model = model_line(pos_halfspan, fil.phi0, model_rate)
-            self.p1.plot.plot(xx, model, connect="finite",
-                              pen=pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine))
+        self.model_item = self.p1.plot.plot([], [], connect="finite", pen=_DASH)
 
         # --- wiring ----------------------------------------------------------
         for p in self.panels:
@@ -138,11 +145,38 @@ class DetailWindow(QtWidgets.QMainWindow):
             p.vb.regionSelected.connect(self._on_select)
             p.vb.regionDeselected.connect(self._on_deselect)
         self.store.changed.connect(self._restyle_all)
-        self._restyle_all()
+        self.params.changed.connect(self._refit)
+        self._refit()                                  # fill roll/residual + model
         self.statusBar().showMessage(
             "left-drag = mark   |   right-drag = unmark   |   scroll = zoom   |   click = toggle one")
 
+    def _open_3d(self):
+        """Open this filament's 3D view (GL imported lazily so 2D never needs it)."""
+        try:
+            from view3d_window import View3DWindow
+        except ImportError as e:
+            QtWidgets.QMessageBox.warning(
+                self, "View 3D", f"3D view needs PyOpenGL:\n{e}\n\npip install PyOpenGL")
+            return
+        self.view3d = View3DWindow(self.fil, self.params.ds, self.store,
+                                   volume=self.map_volume, map_voxel=self.map_voxel,
+                                   parent=self)
+        self.view3d.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.view3d.show()
+
     # --- interaction ---------------------------------------------------------
+    def _refit(self):
+        """Parameters changed (or first show): refresh roll/residual data + model."""
+        self.p1.set_data(self.fil.pos, self.fil.phi, self.fil.tags)
+        self.p2.set_data(self.fil.pos, self.fil.delta, self.fil.tags)
+        if self.fil.fittable and np.isfinite(self.fil.phi0):
+            xx, model = model_line(self.params.ds.pos_halfspan, self.fil.phi0,
+                                   self.params.model_rate)
+            self.model_item.setData(xx, model)
+        else:
+            self.model_item.setData([], [])
+        self._restyle_all()
+
     def _reset_view(self):
         for p in self.panels:
             p.vb.autoRange()
@@ -155,7 +189,7 @@ class DetailWindow(QtWidgets.QMainWindow):
             p.show_hover(idx)
         t = int(self.fil.tags[idx])
         self.readout.setText(
-            f"tag {t}   pos={self.fil.pos[idx]:+.1f}px   "
+            f"tag {t}   pos={self.fil.pos[idx]:+.1f}Å   "
             f"roll={self.fil.phi[idx]:+.1f}°   delta={self.fil.delta[idx]:+.1f}°"
             f"   {'[MARKED]' if self.store.is_marked(t) else ''}")
 

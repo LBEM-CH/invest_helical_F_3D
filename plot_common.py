@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6 import QtCore
+from PyQt6 import QtCore, QtWidgets
 
 # A viridis-like colormap defined explicitly so we don't depend on matplotlib
 # (pyqtgraph's get('viridis') needs matplotlib/colorcet installed).
@@ -19,6 +19,14 @@ _VIRIDIS = pg.ColorMap(
 )
 MARK_COLOR = (220, 30, 30)          # red: marked for removal
 HILITE_PEN = pg.mkPen((255, 140, 0), width=2.5)   # orange ring: linked hover
+
+
+def viridis_rgba(values: np.ndarray) -> np.ndarray:
+    """(N, 4) float RGBA: viridis across the min..max of `values` (e.g. position)."""
+    v = np.asarray(values, float)
+    rng = np.ptp(v)
+    norm = (v - v.min()) / rng if rng > 0 else np.zeros_like(v)
+    return np.array([_VIRIDIS.map(float(x), mode="float") for x in norm])
 
 
 def pos_brushes(pos: np.ndarray, marked_mask: np.ndarray):
@@ -59,3 +67,87 @@ class SelectableViewBox(pg.ViewBox):
                 (self.regionSelected if left else self.regionDeselected).emit(rect)
         else:
             super().mouseDragEvent(ev, axis=axis)   # middle-drag etc. keep default
+
+
+class ModelParams(QtCore.QObject):
+    """Live helix parameters, shared by every window.
+
+    Thin Qt wrapper around the Dataset: the values live on the Dataset (so the
+    fit machinery reads them straight off it), and `changed` fires after a
+    set+recompute so all open views redraw their model overlays in lockstep.
+    """
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, ds):
+        super().__init__()
+        self.ds = ds
+
+    @property
+    def twist(self) -> float:
+        return self.ds.twist
+
+    @property
+    def rise(self) -> float:
+        return self.ds.rise
+
+    @property
+    def pixelsize(self) -> float:
+        return self.ds.pixelsize
+
+    @property
+    def model_rate(self) -> float:
+        return self.ds.model_rate
+
+    def update(self, twist=None, rise=None, pixelsize=None) -> None:
+        self.ds.set_params(
+            self.ds.twist if twist is None else twist,
+            self.ds.rise if rise is None else rise,
+            self.ds.pixelsize if pixelsize is None else pixelsize)
+        self.changed.emit()
+
+
+class ParamBar(QtWidgets.QWidget):
+    """twist / rise / pixel-size spin boxes bound to a ModelParams.
+
+    Editing a box retunes the shared params (which refits + signals); the boxes
+    also re-sync from `params.changed` so the two windows' bars stay identical.
+    """
+
+    def __init__(self, params: ModelParams, parent=None):
+        super().__init__(parent)
+        self.params = params
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.sp_twist = self._spin(-180.0, 180.0, 3, 0.1, " °/sub")
+        self.sp_rise = self._spin(0.001, 10000.0, 3, 0.1, " Å/sub")
+        self.sp_px = self._spin(0.001, 1000.0, 4, 0.01, " Å/px")
+        for label, sp in (("twist", self.sp_twist), ("rise", self.sp_rise),
+                          ("pixel", self.sp_px)):
+            lay.addWidget(QtWidgets.QLabel(label))
+            lay.addWidget(sp)
+        self._sync()
+        for sp in (self.sp_twist, self.sp_rise, self.sp_px):
+            sp.valueChanged.connect(self._emit)
+        params.changed.connect(self._sync)
+
+    @staticmethod
+    def _spin(lo, hi, decimals, step, suffix):
+        sp = QtWidgets.QDoubleSpinBox()
+        sp.setRange(lo, hi)
+        sp.setDecimals(decimals)
+        sp.setSingleStep(step)
+        sp.setSuffix(suffix)
+        sp.setKeyboardTracking(False)   # fire on enter/focus-out, not per keystroke
+        return sp
+
+    def _emit(self, *_):
+        self.params.update(twist=self.sp_twist.value(), rise=self.sp_rise.value(),
+                           pixelsize=self.sp_px.value())
+
+    def _sync(self):
+        for sp, val in ((self.sp_twist, self.params.twist),
+                        (self.sp_rise, self.params.rise),
+                        (self.sp_px, self.params.pixelsize)):
+            sp.blockSignals(True)
+            sp.setValue(val)
+            sp.blockSignals(False)

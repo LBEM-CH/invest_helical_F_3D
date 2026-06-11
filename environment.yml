@@ -1,0 +1,22 @@
+# Self-contained conda environment for invest_helical_F_3D.
+# conda-forge's pyqt pulls in xcb-util-cursor (libxcb-cursor.so.0) and the rest
+# of the X/xcb system libraries, so the GUI runs with no root and no system
+# packages -- the right install path for a shared / no-sudo cluster.
+#
+#   conda env create -f environment.yml
+#   conda activate invest_helical
+#
+name: invest_helical
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pyqt>=6.5
+  - pyqtgraph>=0.13
+  - numpy>=1.20
+  - scipy>=1.7
+  - pyopengl>=3.1        # in-app 3D view ("View 3D")
+  - mrcfile>=1.4         # 3D view density overlay (.mrc maps)
+  - pip
+  - pip:
+      - eulerangles>=1.0   # pip-only; pure-python, needed only for --relion

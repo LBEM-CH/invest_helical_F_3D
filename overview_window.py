@@ -6,9 +6,10 @@ author: Wen-Lu Chung
 
 Left: a scrollable grid of per-filament panels (roll vs real position + screw
 model), one per filament in the tomogram. Right: the XY projection map of the
-whole tomogram. Hovering a panel highlights that filament on the map; clicking a
-panel opens its detail window. Panels whose filament has marked segments turn red
-so triage progress is visible at a glance.
+whole tomogram, plus the live twist / rise / pixel-size controls. Hovering a
+panel highlights that filament on the map; clicking a panel opens its detail
+window. Panels whose filament has marked segments turn red so triage progress is
+visible at a glance. Retuning the parameters refits every panel instantly.
 """
 
 from __future__ import annotations
@@ -20,36 +21,42 @@ from PyQt6 import QtCore, QtWidgets
 from dynamo_table import Dataset
 from detail_window import DetailWindow
 from helix_geom import model_line
-from plot_common import pos_brushes
+from plot_common import ModelParams, ParamBar, pos_brushes
 from selection_store import SelectionStore
 
 _PANEL_W, _PANEL_H = 190, 150
+_DASH = pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine)
 
 
 class _MiniPanel:
     """Small roll-vs-position panel for one filament in the overview grid."""
 
-    def __init__(self, glw, row, col, fil, model_rate, halfspan):
+    def __init__(self, glw, row, col, fil):
         self.fil = fil
         self.plot = glw.addPlot(row=row, col=col)
         self.plot.setMouseEnabled(False, False)        # panels are for glance/click, not zoom
         self.plot.hideButtons()
         self.plot.setMenuEnabled(False)                # no right-click context menu
-        self.plot.setXRange(-halfspan, halfspan, padding=0)
         self.plot.setYRange(-180, 180, padding=0)
         self.plot.getAxis("bottom").setStyle(showValues=False)
         self.plot.getAxis("left").setStyle(showValues=False)
         self.scatter = pg.ScatterPlotItem(size=6, pen=pg.mkPen(None))
         self.plot.addItem(self.scatter)
-        if fil.n >= 5 and np.isfinite(fil.phi0):
-            xx, model = model_line(halfspan, fil.phi0, model_rate)
-            self.plot.plot(xx, model, connect="finite",
-                           pen=pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine))
+        self.model_item = self.plot.plot([], [], connect="finite", pen=_DASH)
         self.vb = self.plot.getViewBox()
+
+    def redraw_model(self, rate, halfspan):
+        """Rescale x to the shared span and redraw the dashed screw (rate-dependent)."""
+        self.plot.setXRange(-halfspan, halfspan, padding=0)
+        if self.fil.fittable and np.isfinite(self.fil.phi0):
+            xx, model = model_line(halfspan, self.fil.phi0, rate)
+            self.model_item.setData(xx, model)
+        else:
+            self.model_item.setData([], [])
 
     def restyle(self, store):
         marked = np.array([store.is_marked(t) for t in self.fil.tags], dtype=bool)
-        if self.fil.n >= 5 and np.isfinite(self.fil.phi0):
+        if self.fil.fittable and np.isfinite(self.fil.phi0):
             self.scatter.setData(x=self.fil.pos, y=self.fil.phi,
                                  brush=pos_brushes(self.fil.pos, marked))
         else:
@@ -60,14 +67,19 @@ class _MiniPanel:
 
 class OverviewWindow(QtWidgets.QMainWindow):
 
-    def __init__(self, ds: Dataset, store: SelectionStore, cols: int = 5):
+    def __init__(self, ds: Dataset, store: SelectionStore, params: ModelParams,
+                 cols: int = 5, map_volume=None, map_voxel=None, gl_enabled: bool = True):
         super().__init__()
         self.ds = ds
         self.store = store
+        self.params = params
+        self.map_volume = map_volume
+        self.map_voxel = map_voxel
+        self.gl_enabled = gl_enabled
         self.halfspan = ds.pos_halfspan
         self.detail = None
         self.setWindowTitle(
-            f"invest_helical_F_3D — tomo {ds.tomo} — {len(ds.filaments)} filaments")
+            f"invest_helical_F_3D — {ds.fmt} tomo {ds.tomo} — {len(ds.filaments)} filaments")
         self.resize(1500, 850)
 
         splitter = QtWidgets.QSplitter()
@@ -79,16 +91,16 @@ class OverviewWindow(QtWidgets.QMainWindow):
         self.glw.setFixedSize(cols * _PANEL_W, nrows * _PANEL_H)
         self.panels: list[_MiniPanel] = []
         for k, fil in enumerate(ds.filaments):
-            p = _MiniPanel(self.glw, k // cols, k % cols, fil, ds.model_rate, self.halfspan)
-            self.panels.append(p)
+            self.panels.append(_MiniPanel(self.glw, k // cols, k % cols, fil))
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(self.glw)
         scroll.setWidgetResizable(False)
         splitter.addWidget(scroll)
 
-        # --- right: tomogram XY map ------------------------------------------
+        # --- right: controls + tomogram XY map -------------------------------
         right = QtWidgets.QWidget()
         rlay = QtWidgets.QVBoxLayout(right)
+        rlay.addWidget(ParamBar(params))
         self.status = QtWidgets.QLabel("hover a filament panel…")
         rlay.addWidget(self.status)
         map_glw = pg.GraphicsLayoutWidget()
@@ -109,7 +121,8 @@ class OverviewWindow(QtWidgets.QMainWindow):
         self.glw.scene().sigMouseMoved.connect(self._on_move)
         self.glw.scene().sigMouseClicked.connect(self._on_click)
         self.store.changed.connect(self._restyle_all)
-        self._restyle_all()
+        self.params.changed.connect(self._on_params)
+        self._on_params()                              # initial model draw + ranges
 
     # --- map -----------------------------------------------------------------
     def _draw_map(self):
@@ -145,14 +158,22 @@ class OverviewWindow(QtWidgets.QMainWindow):
         p = self._panel_at(ev.scenePos())
         if p is None:
             return
-        self.detail = DetailWindow(p.fil, self.ds.model_rate, self.halfspan,
-                                   self.store, parent=self)
+        self.detail = DetailWindow(p.fil, self.params, self.store,
+                                   map_volume=self.map_volume, map_voxel=self.map_voxel,
+                                   gl_enabled=self.gl_enabled, parent=self)
         self.detail.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.detail.show()
+
+    def _on_params(self):
+        """Parameters changed: rescale to the new Angstrom span and refit overlays."""
+        self.halfspan = self.ds.pos_halfspan
+        for p in self.panels:
+            p.redraw_model(self.ds.model_rate, self.halfspan)
+            p.restyle(self.store)
 
     def _restyle_all(self):
         for p in self.panels:
             p.restyle(self.store)
         self.setWindowTitle(
-            f"invest_helical_F_3D — tomo {self.ds.tomo} — "
+            f"invest_helical_F_3D — {self.ds.fmt} tomo {self.ds.tomo} — "
             f"{len(self.ds.filaments)} filaments — {self.store.count()} marked")
