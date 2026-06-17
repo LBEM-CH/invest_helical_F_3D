@@ -6,3 +6,11 @@ temp.tbl
 remove_list.txt
 *.tmp
 .DS_Store
+
+# local test data / maps — keep out of the repo
+test_data/
+*.star
+*.mrc
+*.em
+*.map
+*.rec
