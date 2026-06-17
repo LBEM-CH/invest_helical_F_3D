@@ -67,7 +67,9 @@ def _import_or_die(relion: bool):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="Interactive helical-filament segment triage (mark for removal).")
-    ap.add_argument("path", help="Dynamo averages folder, or a RELION .star file")
+    ap.add_argument("path", help="Dynamo project folder (…/abp_align_eo, shows "
+                                 "per-iteration paths), a single averages folder, "
+                                 "or a RELION .star file")
     fmt = ap.add_mutually_exclusive_group()
     fmt.add_argument("--dynamo", action="store_true",
                      help="treat `path` as a Dynamo averages folder")
@@ -119,7 +121,8 @@ def detect_format(args) -> str:
     if os.path.isfile(args.path) and args.path.lower().endswith(".star"):
         return "relion"
     if os.path.isdir(args.path):
-        return "dynamo"
+        from relion_star import is_refine_job
+        return "relion" if is_refine_job(args.path) else "dynamo"
     sys.stderr.write(
         f"cannot tell if {args.path!r} is Dynamo or RELION; "
         "pass --dynamo or --relion.\n")
@@ -130,8 +133,8 @@ def resolve_pixelsize(args, fmt: str) -> float:
     if args.pixelsize is not None:
         return args.pixelsize
     if fmt == "relion":
-        from relion_star import image_pixel_size
-        px = image_pixel_size(args.path)
+        from relion_star import final_star, image_pixel_size
+        px = image_pixel_size(final_star(args.path))
         if px is not None:
             sys.stderr.write(f"pixel size from star optics: {px} A/px\n")
             return px
@@ -147,8 +150,8 @@ def choose_tomogram(path, fmt):
     """Startup chooser when --tomo is omitted and several tomograms exist."""
     from PyQt6 import QtWidgets
     if fmt == "relion":
-        from relion_star import tomogram_names
-        tomos = tomogram_names(path)
+        from relion_star import final_star, tomogram_names
+        tomos = tomogram_names(final_star(path))
     else:
         from dynamo_table import available_tomograms
         tomos = available_tomograms(path)
@@ -178,8 +181,8 @@ def main(argv=None):
     if fmt == "dynamo" and not os.path.isdir(args.path):
         sys.stderr.write(f"not a folder: {args.path}\n")
         sys.exit(1)
-    if fmt == "relion" and not os.path.isfile(args.path):
-        sys.stderr.write(f"not a file: {args.path}\n")
+    if fmt == "relion" and not os.path.exists(args.path):
+        sys.stderr.write(f"not found: {args.path}\n")
         sys.exit(1)
 
     # Decide on OpenGL BEFORE the QApplication: over SSH, disabling the xcb GLX

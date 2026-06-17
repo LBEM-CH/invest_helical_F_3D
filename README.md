@@ -18,11 +18,18 @@ filament:
 - compares to the screw model `roll = (twist/rise)·pos + phase`.
 
 **Inputs.** Dynamo: concatenates and sorts the ref tables by tag, groups filaments by
-column 23, poses from the ZXZ-extrinsic Eulers. RELION: groups by `_rlnHelicalTubeID`,
+column 23, poses from the ZXZ-extrinsic Eulers. Point it at the **project folder**
+(`…/abp_align_eo`) and it auto-finds `results/ite_*/averages/`, uses the **last real
+iteration** as the working set (the empty N+1 placeholder is skipped), and keeps the earlier
+iterations for the per-segment convergence paths; a single `averages/` folder also works
+(no paths). RELION: groups by `_rlnHelicalTubeID`,
 coordinates from `_rlnCoordinateX/Y/Z`, and converts the poses
 (`_rlnTomoSubtomogram*` combined with `_rlnAngle*`, or `_rlnAngle*Prior` when no refined
 angles exist) back to the Dynamo convention so both paths share one fit. The pixel size is
-read from the star optics block (override with `--pixelsize`).
+read from the star optics block (override with `--pixelsize`). Point it at a **Refine3D job
+folder** (containing `run_data.star` + `run_it*_data.star`) and it reads `run_data.star` as
+the working set and the `run_it*` files as the per-iteration history (`run_it000` = start);
+a single `.star` also works (no paths).
 
 A segment whose alignment drifted lands at its true (wrong) position and visibly leaves the
 model line — that's what you mark.
@@ -41,6 +48,14 @@ model line — that's what you mark.
 - **Mark for removal:** **left-drag** a rubber-band box to mark, **right-drag** to unmark,
   click *Select all in filament*, or click individual points to toggle. *Clear filament*
   unmarks the whole tube. Marks are red everywhere and saved immediately.
+- **Iteration paths** (Dynamo project folder, or RELION Refine3D job folder): a thin grey
+  trail per segment showing how its roll moved from the **starting value** (grey dot,
+  iteration 0 — Dynamo `ite_0001/starting_values/`, RELION `run_it000_data.star`) through each
+  refinement iteration to the **final pose** (the colored dot). Intermediate iterations are
+  line-only. Rolls stay within ±180° — a step
+  crossing the ±180 seam wraps around the edge rather than streaking. A segment whose trail
+  wanders never settled. Toggle it off in the toolbar; solid line (vs the dashed model),
+  beneath the dots.
 
 ### Live helix controls
 Both windows carry **twist / rise / pixel size** spin boxes (rise in Å, pixel size in
@@ -138,9 +153,9 @@ ssh -XY user@cluster
 conda activate invest_helical          # or: source .venv/bin/activate
 cd ~/LBEM/invest_helical_F_3D
 
-# Dynamo (auto-detected from the folder)
+# Dynamo project folder (auto-finds results/ite_*/averages, shows iteration paths)
 python invest_helical_F_3D.py \
-  /mnt/.../dynamo_project_b4/abp_align_eo/results/ite_0004/averages \
+  /mnt/.../dynamo_project_b4/abp_align_eo \
   --tomo 1 --twist -1.4 --rise 4.75 --pixelsize 7.92
 
 # RELION 5 (auto-detected from the .star extension)

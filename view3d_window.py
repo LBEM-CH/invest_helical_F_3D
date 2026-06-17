@@ -169,6 +169,11 @@ class View3DWindow(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(w)
         v.addWidget(QtWidgets.QLabel(f"<b>filament {self.fil.fid}</b>  (n={self.fil.n})"))
 
+        self.btn_home = QtWidgets.QPushButton("Reset view (home)")
+        self.btn_home.setToolTip("recenter and reframe the filament (undo zoom/rotate)")
+        self.btn_home.clicked.connect(self._center_camera)
+        v.addWidget(self.btn_home)
+
         self.chk_pose = QtWidgets.QCheckBox("Show pose triads")
         self.chk_pose.setChecked(True)
         self.chk_pose.toggled.connect(self._refresh)
@@ -226,10 +231,12 @@ class View3DWindow(QtWidgets.QMainWindow):
 
     # --- scene ---------------------------------------------------------------
     def _center_camera(self):
+        """Frame the whole filament from a fixed default angle (also the Home reset)."""
         c = self.fil.xyz.mean(0)
         span = float(np.ptp(self.fil.xyz, axis=0).max())
         self.view.opts["center"] = pg.Qt.QtGui.QVector3D(*c)
-        self.view.setCameraPosition(distance=max(span * 1.6, 10.0))
+        self.view.setCameraPosition(distance=max(span * 1.6, 10.0),
+                                    azimuth=45, elevation=30)
 
     def _recolor(self):
         marked = np.array([self.store.is_marked(t) for t in self.fil.tags], bool)

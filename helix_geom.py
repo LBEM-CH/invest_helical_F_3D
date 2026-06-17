@@ -98,6 +98,16 @@ def fit_pose(xyz: np.ndarray, eulers: np.ndarray) -> dict:
     return dict(order=order, pos=pos, phi=phi, axis=n)
 
 
+def roll_from_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """Measured roll (deg) for ZXZ-extrinsic eulers about a fixed filament axis.
+
+    Used to recompute each segment's roll at earlier Dynamo iterations (same axis,
+    different pose) without redoing the SVD fit.
+    """
+    D = Rot.from_euler('ZXZ', np.asarray(eulers, float), degrees=True)
+    return roll_about_axis(D, axis)
+
+
 def fit_model(pos: np.ndarray, phi: np.ndarray, rate: float) -> dict:
     """Fit the screw phase to measured rolls, given the rate.
 

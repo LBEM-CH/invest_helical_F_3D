@@ -36,7 +36,47 @@ and pull the pixel size from the optics block (_rlnImagePixelSize).
 
 from __future__ import annotations
 
+import glob
+import os
+import re
+
 import numpy as np
+
+
+def is_refine_job(path: str) -> bool:
+    """True if `path` is a directory holding a RELION refinement (run_data.star or
+    run_it*_data.star) -- so it is read as RELION, not as a Dynamo folder."""
+    return os.path.isdir(path) and bool(
+        glob.glob(os.path.join(path, "run_data.star"))
+        or glob.glob(os.path.join(path, "run_it*_data.star")))
+
+
+def final_star(path: str) -> str:
+    """The working particle star: run_data.star inside a Refine3D job folder, else
+    `path` itself (a single .star). Falls back to the last run_it*_data.star."""
+    if not os.path.isdir(path):
+        return path
+    run = os.path.join(path, "run_data.star")
+    if os.path.isfile(run):
+        return run
+    its = sorted(glob.glob(os.path.join(path, "run_it*_data.star")))
+    if its:
+        return its[-1]
+    raise FileNotFoundError(f"no run_data.star or run_it*_data.star in {path!r}")
+
+
+def iteration_stars(path: str) -> list[tuple[int, str]]:
+    """[(iteration_number, star), ...] for run_it*_data.star, oldest->newest
+    (run_it000 = the starting point). Empty for a single .star (no history)."""
+    if not os.path.isdir(path):
+        return []
+    out = []
+    for s in glob.glob(os.path.join(path, "run_it*_data.star")):
+        m = re.search(r"run_it(\d+)_data\.star$", os.path.basename(s))
+        if m:
+            out.append((int(m.group(1)), s))
+    out.sort(key=lambda x: x[0])
+    return out
 
 
 def read_star(path: str) -> dict:

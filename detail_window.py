@@ -27,6 +27,49 @@ from helix_geom import model_line
 from plot_common import HILITE_PEN, ModelParams, ParamBar, SelectableViewBox, pos_brushes
 
 _DASH = pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine)
+_TRAJ_PEN = pg.mkPen((80, 80, 80, 160), width=1.6)   # grey iteration trails (thicker, antialiased)
+
+
+def _iter_path_xy(pos, traj_roll):
+    """Connect each segment's per-iteration rolls, keeping every value in (-180,180]
+    (the real roll domain -- no >180 numbers). A step that crosses the +/-180 seam is
+    drawn as two pieces: up to the edge, then in from the opposite edge (a NaN break
+    between), so the trail "wraps" instead of running off-scale, and no dot is left
+    unlinked. A NaN also separates segments, for one connect='finite' item.
+    """
+    n_iter, N = traj_roll.shape
+    xs, ys = [], []
+    for j in range(N):
+        x = float(pos[j])
+        prev = None
+        for i in range(n_iter):
+            r = traj_roll[i, j]
+            if not np.isfinite(r):
+                prev = None
+                continue
+            if prev is not None:
+                step = ((r - prev + 180.0) % 360.0) - 180.0    # short signed move
+                if prev + step > 180.0:                        # crossed the top seam
+                    xs += [x, np.nan, x]; ys += [180.0, np.nan, -180.0]
+                elif prev + step < -180.0:                     # crossed the bottom seam
+                    xs += [x, np.nan, x]; ys += [-180.0, np.nan, 180.0]
+            xs.append(x); ys.append(float(r))
+            prev = r
+        xs.append(np.nan); ys.append(np.nan)                   # separate segments
+    return np.asarray(xs), np.asarray(ys)
+
+
+def _iter_start_xy(pos, traj_roll):
+    """Positions for the starting-value markers: row 0 (iteration 0, the start that
+    seeded iteration 1). Intermediate iterations get NO marker -- only the line --
+    and the final iteration is the colored data dot. Returns (xs, ys)."""
+    start = traj_roll[0]
+    xs, ys = [], []
+    for j in range(len(start)):
+        r = start[j]
+        if np.isfinite(r):
+            xs.append(float(pos[j])); ys.append(float(r))
+    return xs, ys
 
 
 class _Panel:
@@ -38,11 +81,12 @@ class _Panel:
         self.plot = glw.addPlot(row=row, col=col, viewBox=self.vb, title=title)
         self.plot.setLabel("bottom", xlabel)
         self.plot.setLabel("left", ylabel)
-        self.plot.showGrid(x=True, y=True, alpha=0.3)
         self.plot.setMenuEnabled(False)          # no right-click context menu (it's distracting)
         # hoverable for the linked-hover signal, but hoverSize=-1 (default) so the
-        # dot itself does NOT grow -- the highlight ring is the only hover cue.
-        self.scatter = pg.ScatterPlotItem(size=10, hoverable=True, pen=pg.mkPen(None))
+        # dot itself does NOT grow -- the highlight ring is the only hover cue. tip=None
+        # suppresses the x/y/data tooltip block (the readout label shows it instead).
+        self.scatter = pg.ScatterPlotItem(size=10, hoverable=True, tip=None,
+                                          pen=pg.mkPen(None))
         self.highlight = pg.ScatterPlotItem(size=18, pen=HILITE_PEN,
                                             brush=pg.mkBrush(None))
         self.plot.addItem(self.scatter)
@@ -112,8 +156,20 @@ class DetailWindow(QtWidgets.QMainWindow):
             self.btn_3d.setEnabled(False)
             self.btn_3d.setToolTip("OpenGL unavailable (typical over ssh -XY). "
                                    "Run locally, or with --gl / VirtualGL, for the 3D view.")
+        self.chk_traj = QtWidgets.QCheckBox("Iteration paths")
+        _has_traj = fil.traj_roll is not None
+        self.chk_traj.setChecked(_has_traj)
+        self.chk_traj.setEnabled(_has_traj)
+        self.chk_traj.setToolTip(
+            (f"per-segment roll path: start (grey) → "
+             f"{sum(1 for i in fil.traj_iters if i != 0)} iterations → final (colored dot)")
+            if _has_traj else
+            "point the tool at the Dynamo project folder (…/abp_align_eo) "
+            "to see how each segment's roll converged from its starting value")
+        self.chk_traj.toggled.connect(self._refit)
         for w in (self.btn_all, self.btn_clear, self.btn_home, self.btn_back, self.btn_3d):
             bar.addWidget(w)
+        bar.addWidget(self.chk_traj)
         bar.addWidget(ParamBar(params))
         self.readout = QtWidgets.QLabel("hover a segment…")
         self.readout.setMinimumWidth(340)
@@ -136,6 +192,18 @@ class DetailWindow(QtWidgets.QMainWindow):
         self.p3.set_data(fil.xy[:, 0], fil.xy[:, 1], fil.tags)
         self.p3.plot.plot(fil.xy[:, 0], fil.xy[:, 1],
                           pen=pg.mkPen((150, 150, 150), width=1))   # connecting line
+        self.traj_item = pg.PlotDataItem([], [], connect="finite", pen=_TRAJ_PEN,
+                                         antialias=True)
+        self.traj_item.setZValue(-10)                  # beneath the dots and model line
+        # ignoreBounds: trails must not drive auto-range -- the view stays on the
+        # roll domain (~[-180,180]); genuinely big-wandering trails just run off it.
+        self.p1.plot.addItem(self.traj_item, ignoreBounds=True)
+        # grey marker at the starting values (iteration 0); the final iter is the
+        # colored dot, and intermediate iters are line-only.
+        self.traj_nodes = pg.ScatterPlotItem(size=7, brush=pg.mkBrush(105, 105, 105, 235),
+                                             pen=pg.mkPen(None), hoverable=False)
+        self.traj_nodes.setZValue(-5)                  # above the trail line, below the dots
+        self.p1.plot.addItem(self.traj_nodes, ignoreBounds=True)
         self.model_item = self.p1.plot.plot([], [], connect="finite", pen=_DASH)
 
         # --- wiring ----------------------------------------------------------
@@ -177,6 +245,18 @@ class DetailWindow(QtWidgets.QMainWindow):
             self.model_item.setData(xx, model)
         else:
             self.model_item.setData([], [])
+        # per-iteration roll-convergence trails (uses current Angstrom x)
+        if self.fil.traj_roll is not None and self.chk_traj.isChecked():
+            xs, ys = _iter_path_xy(self.fil.pos, self.fil.traj_roll)   # true rolls, seam-aware
+            self.traj_item.setData(xs, ys)
+            nx, ny = _iter_start_xy(self.fil.pos, self.fil.traj_roll)
+            if nx:
+                self.traj_nodes.setData(x=nx, y=ny)
+            else:
+                self.traj_nodes.setData([])
+        else:
+            self.traj_item.setData([], [])
+            self.traj_nodes.setData([])
         self._restyle_all()
 
     def _reset_view(self):
