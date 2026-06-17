@@ -5,3 +5,4 @@ venv/
 temp.tbl
 remove_list.txt
 *.tmp
+.DS_Store
