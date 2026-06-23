@@ -21,11 +21,12 @@ from PyQt6 import QtCore, QtWidgets
 from dynamo_table import Dataset
 from detail_window import DetailWindow
 from helix_geom import model_line
-from plot_common import ModelParams, ParamBar, pos_brushes
+from plot_common import ModelParams, ParamBar, effective_phi, pos_brushes
 from selection_store import SelectionStore
 
 _PANEL_W, _PANEL_H = 190, 150
 _DASH = pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine)
+_EXCL_ZONE = 20.0          # deg: mark for removal when |roll - black| exceeds this
 
 
 class _MiniPanel:
@@ -57,7 +58,7 @@ class _MiniPanel:
     def restyle(self, store):
         marked = np.array([store.is_marked(t) for t in self.fil.tags], dtype=bool)
         if self.fil.fittable and np.isfinite(self.fil.phi0):
-            self.scatter.setData(x=self.fil.pos, y=self.fil.phi,
+            self.scatter.setData(x=self.fil.pos, y=effective_phi(self.fil, store),
                                  brush=pos_brushes(self.fil.pos, marked))
         else:
             self.scatter.setData([])
@@ -100,7 +101,38 @@ class OverviewWindow(QtWidgets.QMainWindow):
         # --- right: controls + tomogram XY map -------------------------------
         right = QtWidgets.QWidget()
         rlay = QtWidgets.QVBoxLayout(right)
-        rlay.addWidget(ParamBar(params))
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(ParamBar(params))
+        self.btn_autoflip = QtWidgets.QPushButton("auto-flip all")
+        self.btn_autoflip.setToolTip("Across every filament: each segment within ±20° of "
+                                     "a register line is flipped onto black (blue→rot, "
+                                     "pink→tilt; priority black > blue > pink, one flip each).")
+        self.btn_autoflip.setStyleSheet(
+            "QPushButton { background-color: rgb(30,150,90); color: white; "
+            "border-radius: 3px; padding: 3px 9px; }")
+        self.btn_autoflip.clicked.connect(self._auto_flip_all)
+        self.btn_resumeflip = QtWidgets.QPushButton("↺ resume all")
+        self.btn_resumeflip.setToolTip("Undo every flip in the tomogram (tilt, rot and "
+                                       "both) — the inverse of auto-flip all.")
+        self.btn_resumeflip.clicked.connect(lambda: self.store.clear_flips())
+        self.btn_autoexcl = QtWidgets.QPushButton("auto-exclude")
+        self.btn_autoexcl.setToolTip("Mark for removal every segment whose (flipped) roll "
+                                     "is more than ±20° off its black line. Run AFTER you've "
+                                     "flipped — only the black line matters now.")
+        self.btn_autoexcl.setStyleSheet(
+            "QPushButton { background-color: rgb(200,40,40); color: white; "
+            "border-radius: 3px; padding: 3px 9px; }")
+        self.btn_autoexcl.clicked.connect(self._auto_exclude)
+        self.btn_invert = QtWidgets.QPushButton("invert selection")
+        self.btn_invert.setToolTip("Invert the removal marks across all segments "
+                                   "(marked <-> unmarked).")
+        self.btn_invert.clicked.connect(self._invert_selection)
+        top.addWidget(self.btn_autoflip)
+        top.addWidget(self.btn_resumeflip)             # next to auto-flip; inverse of it
+        top.addWidget(self.btn_autoexcl)
+        top.addWidget(self.btn_invert)
+        top.addStretch(1)
+        rlay.addLayout(top)
         self.status = QtWidgets.QLabel("hover a filament panel…")
         rlay.addWidget(self.status)
         map_glw = pg.GraphicsLayoutWidget()
@@ -170,6 +202,45 @@ class OverviewWindow(QtWidgets.QMainWindow):
         for p in self.panels:
             p.redraw_model(self.ds.model_rate, self.halfspan)
             p.restyle(self.store)
+
+    def _auto_flip_all(self):
+        """Auto-flip every filament in the tomogram in one batch (one save+signal)."""
+        rate = self.ds.model_rate
+        all_set, all_clear = {}, []
+        for fil in self.ds.filaments:
+            sm, cl = fil.auto_flip_mapping(rate)
+            all_set.update(sm)
+            all_clear.extend(cl)
+        self.store.replace_flips(all_set, all_clear)
+        self.status.setText(
+            f"auto-flip: {len(all_set)} segments flipped across "
+            f"{sum(1 for f in self.ds.filaments if f.fittable)} fittable filaments")
+
+    def _auto_exclude(self, *_):
+        """Mark for removal every segment whose effective (flipped) roll is more than
+        _EXCL_ZONE deg off its black line. Meant to run after flipping: by then only
+        the black register is "good", so anything still off it is bad. (The *_ swallows
+        the bool that QPushButton.clicked emits, so it can't become the threshold.)"""
+        zone = _EXCL_ZONE
+        rate = self.ds.model_rate
+        bad, nfil = [], 0
+        for f in self.ds.filaments:
+            if not (f.fittable and np.isfinite(f.phi0)):
+                continue                                   # no black line to test against
+            resid = ((effective_phi(f, self.store) - (rate * f.pos + f.phi0) + 180) % 360) - 180
+            bad.extend(int(t) for t in f.tags[np.abs(resid) > zone])
+            nfil += 1
+        self.store.add(bad)
+        self.status.setText(
+            f"auto-exclude: marked {len(bad)} segments >±{int(zone)}° off black "
+            f"across {nfil} filaments  ({self.store.count()} total marked)")
+
+    def _invert_selection(self):
+        """Invert the removal marks across every loaded segment (marked <-> unmarked)."""
+        marked = set(self.store.tags())
+        self.store.set_all([int(t) for f in self.ds.filaments for t in f.tags
+                            if int(t) not in marked])
+        self.status.setText(f"inverted selection: {self.store.count()} now marked")
 
     def _restyle_all(self):
         for p in self.panels:

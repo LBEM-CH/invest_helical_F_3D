@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from helix_geom import fit_model, fit_pose, roll_from_eulers
+from helix_geom import (fit_pose, roll_from_eulers, dominant_phase,
+                        register_flip_rotation, flipped_eulers, rot_flip_eulers)
 
 # Dynamo .tbl column indices (0-based).
 COL_TAG = 0
@@ -56,9 +57,12 @@ class Filament:
     xyz: np.ndarray             # (N, 3) tomogram X,Y,Z (px), ordered head->tail (for 3D)
     eulers: np.ndarray          # (N, 3) ZXZ-extrinsic pose (deg), ordered (for 3D glyphs)
     fittable: bool = False      # n >= 5: an axis could be fit
+    polarity: np.ndarray = field(default_factory=lambda: np.array([]))  # (N,) +1/-1 sign(z.axis)
+    flipped: np.ndarray = field(default_factory=lambda: np.array([], bool))  # (N,) minority polarity
     pos: np.ndarray = field(default_factory=lambda: np.array([]))   # (N,) position (Angstrom)
     delta: np.ndarray = field(default_factory=lambda: np.array([])) # (N,) residual to model (deg)
-    phi0: float = float("nan")  # model phase (deg)
+    phi0: float = float("nan")  # model phase of the majority register (deg)
+    phi0_flip: float = float("nan")  # phase of the flipped (minority-polarity) register (deg)
     axis: np.ndarray = None     # (3,) unit filament axis (fittable only); for iteration roll
     traj_roll: np.ndarray = None  # (n_iter, N) roll per Dynamo iteration, ordered like tags; or None
     traj_iters: list = None     # iteration numbers matching traj_roll rows; or None
@@ -68,15 +72,74 @@ class Filament:
         return len(self.tags)
 
     def apply_model(self, rate: float, pixelsize: float) -> None:
-        """Refresh the model-dependent arrays for a new rate / pixel-size."""
+        """Refresh the model-dependent arrays for a new rate / pixel-size.
+
+        The main screw phase (phi0, the black line) is the center of the DENSEST
+        residual cluster -- a robust "majority" that outliers or a rot/tilt split
+        can't drag off, rather than a plain mean over a count-based majority. The
+        dominant polarity of that cluster defines the correct polarity; segments
+        of the opposite polarity are the tilt-flip (pink) register and get their
+        own robust phase (phi0_flip). The rot-flip register is just phi0 + 180.
+        """
         self.pos = self.pos_px * pixelsize
-        if self.fittable:
-            m = fit_model(self.pos, self.phi, rate)
-            self.phi0 = m["phi0"]
-            self.delta = m["delta"]
-        else:
-            self.phi0 = float("nan")
+        if not self.fittable:
+            self.phi0 = self.phi0_flip = float("nan")
+            self.flipped = np.zeros(self.n, bool)
             self.delta = np.full(self.n, np.nan)
+            return
+        self.phi0, main_in = dominant_phase(self.pos, self.phi, rate)
+        # correct polarity = the dominant polarity within the main cluster; the
+        # opposite-polarity segments are the tilt-flipped ones.
+        pol = self.polarity if self.polarity.size == self.n else np.ones(self.n)
+        main_pol = 1.0 if pol[main_in].sum() >= 0 else -1.0
+        self.flipped = pol != main_pol
+        self.delta = ((self.phi - (rate * self.pos + self.phi0) + 180) % 360) - 180
+        self.phi0_flip = (dominant_phase(self.pos[self.flipped], self.phi[self.flipped], rate)[0]
+                          if self.flipped.sum() >= 3 else float("nan"))
+
+    def auto_flip_mapping(self, rate: float, zone: float = 20.0):
+        """Classify every segment by register zone (+/- `zone` deg) and set the net flip
+        that brings it onto black: blue-zone -> rot-flip, pink-zone -> tilt-flip,
+        both-zone (pink+180) -> tilt+rot (priority black > blue > pink > both; segments
+        on black or outside all zones are left at their original angles).
+
+        Returns (set_map, clear_tags): set_map = {tag: new ZXZ eulers}, clear_tags =
+        tags that should carry no flip (restore original). Pure -- applies nothing.
+        """
+        if not self.fittable or not np.isfinite(self.phi0):
+            return {}, []
+        rb = ((self.phi - (rate * self.pos + self.phi0) + 180) % 360) - 180
+        in_black = np.abs(rb) <= zone
+        in_blue = np.abs(((rb - 180 + 180) % 360) - 180) <= zone          # vs black + 180
+        if np.isfinite(self.phi0_flip):
+            rp = ((self.phi - (rate * self.pos + self.phi0_flip) + 180) % 360) - 180
+            in_pink = np.abs(rp) <= zone
+            in_both = np.abs(((rp - 180 + 180) % 360) - 180) <= zone       # vs pink + 180
+        else:
+            in_pink = in_both = np.zeros(self.n, bool)
+        do_rot = in_blue & ~in_black
+        do_tilt = in_pink & ~in_black & ~in_blue
+        do_both = in_both & ~in_black & ~in_blue & ~in_pink
+        set_map = {}
+        if do_rot.any():
+            ri = np.where(do_rot)[0]
+            nr = rot_flip_eulers(self.eulers[ri], self.axis)
+            set_map.update({int(self.tags[i]): tuple(nr[k]) for k, i in enumerate(ri)})
+        if do_tilt.any() or do_both.any():
+            S = register_flip_rotation(self.eulers, self.pos, self.axis, self.flipped,
+                                       rate, self.phi0, self.phi0_flip)
+            if S is not None:
+                for mask, also_rot in ((do_tilt, False), (do_both, True)):
+                    if not mask.any():
+                        continue
+                    mi = np.where(mask)[0]
+                    ne = flipped_eulers(self.eulers[mi], self.pos[mi], self.axis, rate, S,
+                                        np.ones(len(mi), bool))
+                    if also_rot:
+                        ne = rot_flip_eulers(ne, self.axis)
+                    set_map.update({int(self.tags[i]): tuple(ne[k]) for k, i in enumerate(mi)})
+        clear = [int(t) for t in self.tags if int(t) not in set_map]
+        return set_map, clear
 
 
 @dataclass
@@ -126,9 +189,11 @@ def _build_filament(fid, tags, xyz, eulers) -> Filament:
                         xy=xyz[:, :2], xyz=xyz, eulers=eulers, fittable=False)
     fp = fit_pose(xyz, eulers)
     o = fp["order"]
+    # `flipped` (which polarity is the tilt-flip side) is decided in apply_model,
+    # where it can lean on the robust main-register fit; here we just carry polarity.
     return Filament(fid=int(fid), tags=tags[o], pos_px=fp["pos"], phi=fp["phi"],
                     xy=xyz[o, :2], xyz=xyz[o], eulers=eulers[o], fittable=True,
-                    axis=fp["axis"])
+                    axis=fp["axis"], polarity=fp["polarity"])
 
 
 # --- Dynamo --------------------------------------------------------------------
@@ -238,7 +303,7 @@ def _attach_trajectories(filaments, folders, tomo_id) -> None:
         fil.traj_iters = labels
 
 
-def _build_dynamo(path: str, tomo, write_temp: bool):
+def _build_dynamo(path: str, tomo, write_temp: bool, trails: bool = False):
     folders = find_iteration_folders(path)
     final_folder = folders[-1][1]
     n_tables = len(find_ref_tables(final_folder))
@@ -258,7 +323,7 @@ def _build_dynamo(path: str, tomo, write_temp: bool):
             rows[:, COL_TAG].astype(float).astype(int),
             rows[:, COL_XYZ].astype(float),
             rows[:, COL_EULER].astype(float)))
-    if len(folders) > 1:                         # earlier iterations -> convergence trails
+    if trails and len(folders) > 1:              # earlier iterations -> convergence trails
         _attach_trajectories(filaments, folders, tomo_id)
     return tomo_id, len(table), filaments
 
@@ -300,7 +365,7 @@ def _attach_relion_trajectories(filaments, iter_stars, tomo_name) -> None:
         fil.traj_iters = labels
 
 
-def _build_relion(path: str, tomo, write_temp: bool = True):
+def _build_relion(path: str, tomo, write_temp: bool = True, trails: bool = False):
     from relion_star import final_star, iteration_stars, load_particles
     star = final_star(path)
     iters = iteration_stars(path)
@@ -319,14 +384,15 @@ def _build_relion(path: str, tomo, write_temp: bool = True):
         sel = d["tube"] == fid
         filaments.append(_build_filament(
             fid, d["pid"][sel], d["xyz"][sel], d["eulers"][sel]))
-    if len(iters) > 1:                               # earlier iterations -> convergence trails
+    if trails and len(iters) > 1:                    # earlier iterations -> convergence trails
         _attach_relion_trajectories(filaments, iters, tomo_name)
     return tomo_name, d["n"], filaments
 
 
 # --- dispatch ------------------------------------------------------------------
 def load_dataset(source: str, fmt: str, tomo, twist: float, rise: float,
-                 pixelsize: float, write_temp: bool = True) -> Dataset:
+                 pixelsize: float, write_temp: bool = True,
+                 trails: bool = False) -> Dataset:
     """Load a Dynamo folder or a RELION .star into a Dataset and fit it.
 
     fmt       : "dynamo" or "relion".
@@ -334,11 +400,13 @@ def load_dataset(source: str, fmt: str, tomo, twist: float, rise: float,
                 None -> the only/first tomogram.
     twist     : deg / subunit.   rise : Angstrom / subunit.   pixelsize : A/px.
     write_temp: Dynamo only -- write temp.tbl (the working rows) into the folder.
+    trails    : attach per-iteration convergence trails (off by default; the
+                earlier-iteration scan is skipped unless requested).
     """
     if fmt == "relion":
-        tomo_id, n_seg, fils = _build_relion(source, tomo, write_temp)
+        tomo_id, n_seg, fils = _build_relion(source, tomo, write_temp, trails)
     elif fmt == "dynamo":
-        tomo_id, n_seg, fils = _build_dynamo(source, tomo, write_temp)
+        tomo_id, n_seg, fils = _build_dynamo(source, tomo, write_temp, trails)
     else:
         raise ValueError(f"unknown format {fmt!r}")
     ds = Dataset(source=source, fmt=fmt, tomo=tomo_id, twist=twist, rise=rise,

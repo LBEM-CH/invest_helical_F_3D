@@ -11,6 +11,21 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
 
+from helix_geom import roll_from_eulers
+
+
+def effective_phi(fil, store) -> np.ndarray:
+    """Roll per segment with committed flips applied: a flipped tag reads the roll of
+    its stored (flipped) angles, everything else its original roll. Shared by the
+    overview and detail plots so both show flips the same way."""
+    phi = fil.phi.astype(float).copy()
+    if fil.fittable and fil.axis is not None and store.flip_count():
+        for i, t in enumerate(fil.tags):
+            ang = store.get_flip(int(t))
+            if ang is not None:
+                phi[i] = roll_from_eulers(np.asarray(ang, float)[None, :], fil.axis)[0]
+    return phi
+
 # A viridis-like colormap defined explicitly so we don't depend on matplotlib
 # (pyqtgraph's get('viridis') needs matplotlib/colorcet installed).
 _VIRIDIS = pg.ColorMap(

@@ -78,7 +78,7 @@ def parse_args(argv=None):
     ap.add_argument("--tomo", default=None,
                     help="tomogram to load (Dynamo: col 20 id; RELION: TomoName); "
                          "default: only/first present")
-    ap.add_argument("--twist", type=float, default=-1.4, help="helix twist, deg/subunit")
+    ap.add_argument("--twist", type=float, default=0.7, help="helix twist, deg/subunit")
     ap.add_argument("--rise", type=float, default=4.75, help="helix rise, Angstrom/subunit")
     ap.add_argument("--pixelsize", type=float, default=None,
                     help="Angstrom/px; RELION default reads the star optics, "
@@ -91,6 +91,9 @@ def parse_args(argv=None):
                     help="remove-list path (default: <dir>/remove_list.txt)")
     ap.add_argument("--no-temp", action="store_true",
                     help="do not write temp.tbl into a Dynamo folder")
+    ap.add_argument("--iteration-paths", action="store_true",
+                    help="scan earlier iterations and draw per-segment convergence "
+                         "trails (off by default)")
     glgrp = ap.add_mutually_exclusive_group()
     glgrp.add_argument("--gl", action="store_true",
                        help="force-enable the OpenGL 3D view (local display / VirtualGL)")
@@ -211,7 +214,7 @@ def main(argv=None):
     tomo = args.tomo if args.tomo is not None else choose_tomogram(args.path, fmt)
 
     ds = load_dataset(args.path, fmt, tomo, args.twist, args.rise, pixelsize,
-                      write_temp=not args.no_temp)
+                      write_temp=not args.no_temp, trails=args.iteration_paths)
     params = ModelParams(ds)
     out_dir = args.path if os.path.isdir(args.path) else os.path.dirname(args.path)
     out = args.out or os.path.join(out_dir, "remove_list.txt")

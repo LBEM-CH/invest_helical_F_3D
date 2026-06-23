@@ -85,17 +85,24 @@ def fit_pose(xyz: np.ndarray, eulers: np.ndarray) -> dict:
              this function is identical for both inputs.
 
     Returns, all ordered head->tail by real position:
-      order : (N,) indices that sort the input into head->tail order
-      pos   : (N,) real position along axis (same unit as xyz), centered
-      phi   : (N,) measured roll about the axis (deg)
-      axis  : (3,) unit filament axis
+      order    : (N,) indices that sort the input into head->tail order
+      pos      : (N,) real position along axis (same unit as xyz), centered
+      phi      : (N,) measured roll about the axis (deg)
+      axis     : (3,) unit filament axis
+      polarity : (N,) sign of (particle z-axis . filament axis), +1/-1. Which way
+                 each particle points along the axis; a flipped subset (opposite
+                 sign) is a polarity (perpendicular-dyad) ambiguity, not a roll
+                 difference -- see invest_helical's flipped-register overlay.
     """
     n, pos = axis_and_pos(xyz)
     order = np.argsort(pos)
     pos = pos[order]
     D = Rot.from_euler('ZXZ', eulers[order], degrees=True)
     phi = roll_about_axis(D, n)
-    return dict(order=order, pos=pos, phi=phi, axis=n)
+    zaxis = D.as_matrix()[:, :, 2]              # each particle's z-axis in tomo frame
+    polarity = np.sign(zaxis @ n)
+    polarity[polarity == 0] = 1.0
+    return dict(order=order, pos=pos, phi=phi, axis=n, polarity=polarity)
 
 
 def roll_from_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
@@ -123,6 +130,111 @@ def fit_model(pos: np.ndarray, phi: np.ndarray, rate: float) -> dict:
     model = rate * pos + phi0
     delta = ((phi - model + 180) % 360) - 180
     return dict(phi0=float(phi0), delta=delta)
+
+
+def _densest_window(ang: np.ndarray, halfwidth: float) -> np.ndarray:
+    """Boolean mask of the most-populated circular window (center = some sample,
+    members within +/- halfwidth deg). A robust 'mode' for wrapped angles: a
+    minority of outliers or a symmetry-split sub-cluster can't capture it."""
+    ang = np.asarray(ang, float)
+    if ang.size == 0:
+        return np.zeros(0, bool)
+    d = np.abs(((ang[:, None] - ang[None, :] + 180.0) % 360.0) - 180.0)
+    within = d <= halfwidth
+    return within[:, int(np.argmax(within.sum(0)))]
+
+
+def dominant_phase(pos: np.ndarray, phi: np.ndarray, rate: float,
+                   halfwidth: float = 25.0) -> tuple[float, np.ndarray]:
+    """Robust screw phase: the center of the densest cluster of residuals
+    (phi - rate*pos), so outliers / a +180 (rot) or tilt sub-population cannot
+    drag the main line off (unlike a plain mean over a count-based 'majority').
+    Returns (phi0_deg, inlier_mask)."""
+    pos = np.asarray(pos, float)
+    phi = np.asarray(phi, float)
+    if phi.size == 0:
+        return float("nan"), np.zeros(0, bool)
+    r = (phi - rate * pos) % 360.0
+    inliers = _densest_window(r, halfwidth)
+    phi0 = np.degrees(np.angle(np.exp(1j * np.radians(r[inliers])).mean()))
+    return float(phi0), inliers
+
+
+def register_flip_rotation(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray,
+                           flipped: np.ndarray, rate: float, phi0_main: float,
+                           phi0_flip: float, halfwidth: float = 25.0):
+    """The rotation S that maps the flipped (pink) register onto the main (black)
+    register, measured from this filament's own data.
+
+    Both registers are de-screwed (the position-dependent helical roll removed)
+    and averaged, S = mean(main) * mean(flipped)^-1. Each group's mean is taken
+    over the segments whose de-screwed roll is near the GIVEN line phase --
+    phi0_main (black) for the main polarity, phi0_flip (pink) for the flipped --
+    so S is anchored to the drawn lines. (Using each polarity's densest cluster
+    instead would misfire when the main polarity has a second, off-register
+    cluster: S would target that cluster, not black.) Empirically S is a ~180 deg
+    rotation about an axis perpendicular to the filament axis (the polarity dyad).
+    Returns a scipy Rotation, or None if a group is empty / phi0_flip is unset.
+    """
+    flipped = np.asarray(flipped, bool)
+    if (~flipped).sum() < 1 or flipped.sum() < 1 or not np.isfinite(phi0_flip):
+        return None
+    D = Rot.from_euler('ZXZ', np.asarray(eulers, float), degrees=True)
+    descrew = Rot.from_rotvec((-np.radians(rate * np.asarray(pos, float)))[:, None]
+                              * np.asarray(axis, float)[None, :])
+    Dt = descrew * D                                   # de-screwed orientations
+    roll = roll_about_axis(Dt, axis)                   # de-screwed roll ~ (phi - rate*pos)
+
+    def mean_near(group, center):
+        gi = np.where(group)[0]
+        d = np.abs(((roll[gi] - center + 180.0) % 360.0) - 180.0)
+        keep = gi[d <= halfwidth]
+        return Dt[keep if keep.size else gi].mean()    # fallback: whole group
+
+    # The natural rotation between the two registers -- NOT snapped to 180/perp:
+    # for some filaments the pink<->black relation is a rotation about an axis far
+    # from perpendicular (even near-parallel to the filament axis), and forcing it
+    # perpendicular breaks tilt-flip. Exact involution / sequence-closure is handled
+    # by the caller tracking the discrete flip STATE (recomputing each pose from the
+    # original), not by squaring this operator -- so S only has to map pink -> black.
+    return mean_near(~flipped, phi0_main) * mean_near(flipped, phi0_flip).inv()
+
+
+def flipped_eulers(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray,
+                   rate: float, S, to_majority) -> np.ndarray:
+    """Apply the register flip to segments -> new ZXZ-extrinsic eulers (deg).
+
+    For each segment, S (or S^-1) is conjugated by the screw rotation at that
+    segment's position, so the flipped segment lands on the OTHER register at its
+    own position -- only the 3 angles change, the position does not.
+
+      to_majority : per-segment bool. True  -> apply S    (minority -> majority),
+                                       False -> apply S^-1 (majority -> minority).
+    """
+    eulers = np.atleast_2d(np.asarray(eulers, float))
+    pos = np.atleast_1d(np.asarray(pos, float))
+    to_majority = np.atleast_1d(np.asarray(to_majority, bool))
+    D = Rot.from_euler('ZXZ', eulers, degrees=True)
+    descrew = Rot.from_rotvec((-np.radians(rate * pos))[:, None]
+                              * np.asarray(axis, float)[None, :])
+    Sarr = Rot.concatenate([S if t else S.inv() for t in to_majority])
+    Dnew = descrew.inv() * Sarr * descrew * D
+    return Dnew.as_euler('ZXZ', degrees=True)
+
+
+def rot_flip_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """Apply the C2-about-axis ambiguity: rotate each pose 180 deg about the
+    filament axis -> new ZXZ-extrinsic eulers (deg).
+
+    Unlike the polarity (tilt) flip this keeps the particle z-axis pointing the
+    same way; it only shifts the measured roll by exactly +180 deg. So the
+    rot-flipped register is just the main screw line offset by 180 deg. Position
+    is unchanged.
+    """
+    eulers = np.atleast_2d(np.asarray(eulers, float))
+    D = Rot.from_euler('ZXZ', eulers, degrees=True)
+    R = Rot.from_rotvec(np.pi * np.asarray(axis, float))   # 180 deg about the axis
+    return (R * D).as_euler('ZXZ', degrees=True)
 
 
 def model_line(pos_span: float, phi0: float, rate: float,
