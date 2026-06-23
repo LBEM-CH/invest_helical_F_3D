@@ -21,7 +21,6 @@ from __future__ import annotations
 import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
-from scipy.spatial.transform import Rotation as Rot
 
 from dynamo_table import Filament
 from helix_geom import (model_line, register_flip_rotation, flipped_eulers,
@@ -417,24 +416,11 @@ class DetailWindow(QtWidgets.QMainWindow):
             "click the same flip twice to undo). Right-drag = unflip." if flip_on else
             "left-drag = mark   |   right-drag = unmark   |   scroll = zoom   |   click = toggle one")
 
-    @staticmethod
-    def _toggled_state(state, which):
-        """Toggle one bit of a flip state. state in {none,tilt,rot,both}; which in
-        {tilt,rot}. Each bit toggles independently, so the same flip twice cancels."""
-        tilt = state in ("tilt", "both")
-        rot = state in ("rot", "both")
-        if which == "tilt":
-            tilt = not tilt
-        else:
-            rot = not rot
-        return {(0, 0): "none", (1, 0): "tilt", (0, 1): "rot", (1, 1): "both"}[(int(tilt), int(rot))]
-
     def _toggle_flip(self, which):
-        """Toggle the tilt- or rot-bit of each staged segment's flip state. Every pose
-        is recomputed from the ORIGINAL angles for the resulting state, so flips
-        compose AND applying the same flip twice returns exactly to the original
-        (regardless of whether the operators are perfect involutions). The staged set
-        is kept, so the buttons can be clicked repeatedly on the same selection."""
+        """Toggle the tilt- or rot-bit of each staged segment's (tilt, rot) state. The
+        pose is recomputed from the ORIGINAL angles for the resulting state, so flips
+        compose AND the same flip twice returns to the original. Staged set is kept, so
+        the buttons can be clicked repeatedly on the same selection."""
         if not self.flip_staged:
             return
         fil = self.fil
@@ -448,23 +434,23 @@ class DetailWindow(QtWidgets.QMainWindow):
                         if int(t) in self.flip_staged], int)
         orig = fil.eulers[idx]
         rate = self.params.model_rate
-        cand = {"none": orig, "rot": rot_flip_eulers(orig, fil.axis)}
+        pose = {(0, 0): orig, (0, 1): rot_flip_eulers(orig, fil.axis)}
         if S is not None:
             tilt = flipped_eulers(orig, fil.pos[idx], fil.axis, rate, S, np.ones(len(idx), bool))
-            cand["tilt"] = tilt
-            cand["both"] = rot_flip_eulers(tilt, fil.axis)
-        Rcand = {s: Rot.from_euler('ZXZ', v, degrees=True) for s, v in cand.items()}
+            pose[(1, 0)] = tilt
+            pose[(1, 1)] = rot_flip_eulers(tilt, fil.axis)
         set_map, clear = {}, []
         for k, i in enumerate(idx):
             t = int(fil.tags[i])
-            cur = self.store.get_flip(t)
-            Rc = Rot.from_euler('ZXZ', np.asarray(cur if cur else orig[k], float), degrees=True)
-            state = min(Rcand, key=lambda s: float((Rcand[s][k] * Rc.inv()).magnitude()))
-            new = self._toggled_state(state, which)
-            if new == "none":
+            tt, rt = self.store.get_state(t)
+            if which == "tilt":
+                tt ^= 1
+            else:
+                rt ^= 1
+            if (tt, rt) == (0, 0):
                 clear.append(t)
-            elif new in cand:                          # tilt/both need S; skip if absent
-                set_map[t] = tuple(cand[new][k])
+            elif (tt, rt) in pose:                     # tilt states need S; skip if absent
+                set_map[t] = (tt, rt, tuple(pose[(tt, rt)][k]))
         self.store.replace_flips(set_map, clear)       # one save+signal; staged kept
 
     def _commit_flip(self):

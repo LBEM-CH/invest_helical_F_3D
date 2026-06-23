@@ -96,13 +96,29 @@ class SelectionStore(QtCore.QObject):
         return sorted(self._flips)
 
     def get_flip(self, tag: int):
-        """New (tdrot, tilt, narot) for a flipped tag, or None."""
-        return self._flips.get(int(tag))
+        """Resulting (tdrot, tilt, narot) angles for a flipped tag, or None."""
+        v = self._flips.get(int(tag))
+        return None if v is None else (v[2], v[3], v[4])
+
+    def get_state(self, tag: int):
+        """(tilt_flip, rot_flip) bits for a tag -- (0, 0) if not flipped."""
+        v = self._flips.get(int(tag))
+        return (0, 0) if v is None else (v[0], v[1])
+
+    @staticmethod
+    def _store_val(rec):
+        """rec = (tilt, rot, (a1, a2, a3))  ->  (tilt, rot, a1, a2, a3)."""
+        tilt, rot, ang = rec
+        return (int(tilt), int(rot), float(ang[0]), float(ang[1]), float(ang[2]))
 
     def set_flips(self, mapping) -> None:
-        """Add/replace flips. `mapping` is {tag: (a1, a2, a3)}."""
-        for tag, ang in dict(mapping).items():
-            self._flips[int(tag)] = (float(ang[0]), float(ang[1]), float(ang[2]))
+        """Add/replace flips. `mapping` is {tag: (tilt, rot, (a1, a2, a3))}; a
+        (0, 0) state removes the tag."""
+        for tag, rec in dict(mapping).items():
+            if int(rec[0]) or int(rec[1]):
+                self._flips[int(tag)] = self._store_val(rec)
+            else:
+                self._flips.pop(int(tag), None)
         self._after_flip_change()
 
     def unflip(self, tags) -> None:
@@ -112,11 +128,14 @@ class SelectionStore(QtCore.QObject):
 
     def replace_flips(self, set_map, clear_tags=()) -> None:
         """Set/replace some flips and clear others in one go (single save+signal).
-        Used by auto-flip, which re-decides a whole filament at once."""
+        set_map is {tag: (tilt, rot, (a1, a2, a3))}; a (0, 0) state is dropped."""
         for t in _iter(clear_tags):
             self._flips.pop(int(t), None)
-        for tag, ang in dict(set_map).items():
-            self._flips[int(tag)] = (float(ang[0]), float(ang[1]), float(ang[2]))
+        for tag, rec in dict(set_map).items():
+            if int(rec[0]) or int(rec[1]):
+                self._flips[int(tag)] = self._store_val(rec)
+            else:
+                self._flips.pop(int(tag), None)
         self._after_flip_change()
 
     def clear_flips(self, tags=None) -> None:
@@ -150,17 +169,20 @@ class SelectionStore(QtCore.QObject):
         os.replace(tmp, path)            # atomic; safe if the app is killed mid-write
 
     def load_flips(self, path: str) -> None:
-        """Load flipped tags + new angles: 'tag a1 a2 a3' per line (comments ok)."""
+        """Load 'tag tdrot tilt narot tilt_flip rot_flip' per line (comments ok). Old
+        4-column files (no flip-type columns) are read as a tilt flip (1 0)."""
         flips: dict[int, tuple] = {}
         with open(path) as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                parts = line.split()
-                if len(parts) >= 4:
-                    flips[int(float(parts[0]))] = (float(parts[1]), float(parts[2]),
-                                                   float(parts[3]))
+                p = line.split()
+                if len(p) >= 6:
+                    flips[int(float(p[0]))] = (int(float(p[4])), int(float(p[5])),
+                                               float(p[1]), float(p[2]), float(p[3]))
+                elif len(p) >= 4:
+                    flips[int(float(p[0]))] = (1, 0, float(p[1]), float(p[2]), float(p[3]))
         self._flips = flips
         self._after_flip_change()
 
@@ -168,12 +190,17 @@ class SelectionStore(QtCore.QObject):
         path = path or self.flip_path
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
-            fh.write("# invest_helical_F_3D flip list: Dynamo tag + flipped ZXZ angles "
-                     "(cols 7-9). Position (cols 24-26) unchanged.\n")
-            fh.write("# tag\ttdrot\ttilt\tnarot\n")
+            fh.write("# invest_helical_F_3D flip list.\n")
+            fh.write("#   tdrot,tilt,narot = resulting Dynamo ZXZ angles (cols 7-9); "
+                     "position (cols 24-26) unchanged.\n")
+            fh.write("#   tilt_flip = 1 if the polarity (perpendicular-dyad) flip was "
+                     "applied, else 0.\n")
+            fh.write("#   rot_flip  = 1 if the 180-deg-about-axis (C2) flip was "
+                     "applied, else 0.\n")
+            fh.write("# tag\ttdrot\ttilt\tnarot\ttilt_flip\trot_flip\n")
             for tag in sorted(self._flips):
-                a = self._flips[tag]
-                fh.write(f"{tag}\t{a[0]:.4f}\t{a[1]:.4f}\t{a[2]:.4f}\n")
+                tilt, rot, a1, a2, a3 = self._flips[tag]
+                fh.write(f"{tag}\t{a1:.4f}\t{a2:.4f}\t{a3:.4f}\t{tilt}\t{rot}\n")
         os.replace(tmp, path)
 
     def _after_change(self) -> None:

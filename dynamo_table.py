@@ -30,8 +30,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from helix_geom import (fit_pose, roll_from_eulers, dominant_phase,
-                        register_flip_rotation, flipped_eulers, rot_flip_eulers)
+from helix_geom import fit_pose, roll_from_eulers, dominant_phase
 
 # Dynamo .tbl column indices (0-based).
 COL_TAG = 0
@@ -97,49 +96,6 @@ class Filament:
         self.phi0_flip = (dominant_phase(self.pos[self.flipped], self.phi[self.flipped], rate)[0]
                           if self.flipped.sum() >= 3 else float("nan"))
 
-    def auto_flip_mapping(self, rate: float, zone: float = 20.0):
-        """Classify every segment by register zone (+/- `zone` deg) and set the net flip
-        that brings it onto black: blue-zone -> rot-flip, pink-zone -> tilt-flip,
-        both-zone (pink+180) -> tilt+rot (priority black > blue > pink > both; segments
-        on black or outside all zones are left at their original angles).
-
-        Returns (set_map, clear_tags): set_map = {tag: new ZXZ eulers}, clear_tags =
-        tags that should carry no flip (restore original). Pure -- applies nothing.
-        """
-        if not self.fittable or not np.isfinite(self.phi0):
-            return {}, []
-        rb = ((self.phi - (rate * self.pos + self.phi0) + 180) % 360) - 180
-        in_black = np.abs(rb) <= zone
-        in_blue = np.abs(((rb - 180 + 180) % 360) - 180) <= zone          # vs black + 180
-        if np.isfinite(self.phi0_flip):
-            rp = ((self.phi - (rate * self.pos + self.phi0_flip) + 180) % 360) - 180
-            in_pink = np.abs(rp) <= zone
-            in_both = np.abs(((rp - 180 + 180) % 360) - 180) <= zone       # vs pink + 180
-        else:
-            in_pink = in_both = np.zeros(self.n, bool)
-        do_rot = in_blue & ~in_black
-        do_tilt = in_pink & ~in_black & ~in_blue
-        do_both = in_both & ~in_black & ~in_blue & ~in_pink
-        set_map = {}
-        if do_rot.any():
-            ri = np.where(do_rot)[0]
-            nr = rot_flip_eulers(self.eulers[ri], self.axis)
-            set_map.update({int(self.tags[i]): tuple(nr[k]) for k, i in enumerate(ri)})
-        if do_tilt.any() or do_both.any():
-            S = register_flip_rotation(self.eulers, self.pos, self.axis, self.flipped,
-                                       rate, self.phi0, self.phi0_flip)
-            if S is not None:
-                for mask, also_rot in ((do_tilt, False), (do_both, True)):
-                    if not mask.any():
-                        continue
-                    mi = np.where(mask)[0]
-                    ne = flipped_eulers(self.eulers[mi], self.pos[mi], self.axis, rate, S,
-                                        np.ones(len(mi), bool))
-                    if also_rot:
-                        ne = rot_flip_eulers(ne, self.axis)
-                    set_map.update({int(self.tags[i]): tuple(ne[k]) for k, i in enumerate(mi)})
-        clear = [int(t) for t in self.tags if int(t) not in set_map]
-        return set_map, clear
 
 
 @dataclass
