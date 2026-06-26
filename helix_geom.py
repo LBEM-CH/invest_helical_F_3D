@@ -46,6 +46,44 @@ def model_rate(twist: float = TWIST, rise: float = RISE) -> float:
     return twist / rise
 
 
+# --- Dynamo pose convention ----------------------------------------------------
+# The stored table angles (cols 7-9) are Dynamo ZXZ-*extrinsic*, BUT the tomogram
+# itself carries a handedness flip about Z that should have been applied before
+# reconstruction and was not (the classic Warp/Dynamo tilt-axis convention). The
+# coordinates are fine; the fix lives entirely in the pose. ArtiaX/ChimeraX absorbs
+# this exact flip in its Dynamo->placement transform
+#       tdrot' = -narot - 180,   tilt' = tilt,   narot' = -tdrot + 180,
+# read as extrinsic 'zxz'. Building rotations this way makes a genuine right-handed
+# helix read as +twist (verified: the per-filament screw flips from -1.4 to the true
+# +1.4 and the pose z-axis aligns with the SVD filament axis to |cos|~1.00). Without
+# it (raw intrinsic 'ZXZ') the screw came out mirrored, so +1.4 looked like -1.4.
+#
+# fil.eulers stays the RAW table triple (the flip-export writes angles straight back
+# into a .tbl, so it must round-trip), and every Rotation is built through
+# dynamo_rotation() / written back through rotation_to_dynamo_eulers().
+
+def _artiax_eulers(eulers: np.ndarray) -> np.ndarray:
+    """Raw Dynamo (tdrot, tilt, narot) -> ArtiaX/ChimeraX placement triple (deg)."""
+    e = np.atleast_2d(np.asarray(eulers, float))
+    td, ti, na = e[:, 0], e[:, 1], e[:, 2]
+    return np.column_stack([-na - 180.0, ti, -td + 180.0])
+
+
+def dynamo_rotation(eulers: np.ndarray) -> Rot:
+    """Rotation from raw Dynamo table angles, via the ArtiaX hand-flip + extrinsic
+    zxz. Use this everywhere a pose is built from stored eulers, so the measured
+    screw matches the true (right-handed) twist sign."""
+    return Rot.from_euler('zxz', _artiax_eulers(eulers), degrees=True)
+
+
+def rotation_to_dynamo_eulers(R: Rot) -> np.ndarray:
+    """Inverse of dynamo_rotation: Rotation -> raw Dynamo (tdrot, tilt, narot) deg,
+    so flipped poses can be written straight back into a Dynamo .tbl."""
+    a = np.atleast_2d(R.as_euler('zxz', degrees=True))
+    # invert the ArtiaX transform: [a,b,c] -> [180-c, b, -a-180]
+    return np.column_stack([180.0 - a[:, 2], a[:, 1], -a[:, 0] - 180.0])
+
+
 def axis_and_pos(xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fit the filament axis through the middle and project to a 1D position.
 
@@ -97,7 +135,7 @@ def fit_pose(xyz: np.ndarray, eulers: np.ndarray) -> dict:
     n, pos = axis_and_pos(xyz)
     order = np.argsort(pos)
     pos = pos[order]
-    D = Rot.from_euler('ZXZ', eulers[order], degrees=True)
+    D = dynamo_rotation(eulers[order])
     phi = roll_about_axis(D, n)
     zaxis = D.as_matrix()[:, :, 2]              # each particle's z-axis in tomo frame
     polarity = np.sign(zaxis @ n)
@@ -111,7 +149,7 @@ def roll_from_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
     Used to recompute each segment's roll at earlier Dynamo iterations (same axis,
     different pose) without redoing the SVD fit.
     """
-    D = Rot.from_euler('ZXZ', np.asarray(eulers, float), degrees=True)
+    D = dynamo_rotation(np.asarray(eulers, float))
     return roll_about_axis(D, axis)
 
 
@@ -160,6 +198,28 @@ def dominant_phase(pos: np.ndarray, phi: np.ndarray, rate: float,
     return float(phi0), inliers
 
 
+def polarity_dyad_angle(eulers: np.ndarray, flipped: np.ndarray) -> float:
+    """Angle (deg) between the two polarity groups' mean particle z-axes.
+
+    A genuine tilt flip is a head<->tail dyad: the main and flipped groups point
+    in opposite directions, so their mean z-axes are ~antiparallel and this angle
+    is near 180. When |z.axis| ~ 0 (the particle z-axis is nearly perpendicular to
+    the filament) the polarity SIGN is just noise: it splits the filament into two
+    spurious groups whose mean z-axes are NOT antiparallel, and this angle falls
+    far from 180 (toward 90). Gate the flipped register on this to reject such
+    false flips. Returns the angle in [0, 180], or nan if a group is empty.
+    """
+    flipped = np.asarray(flipped, bool)
+    if flipped.sum() < 1 or (~flipped).sum() < 1:
+        return float("nan")
+    z = dynamo_rotation(np.asarray(eulers, float)).as_matrix()[:, :, 2]
+    zm, zf = z[~flipped].mean(0), z[flipped].mean(0)
+    nm, nf = np.linalg.norm(zm), np.linalg.norm(zf)
+    if nm < 1e-9 or nf < 1e-9:
+        return float("nan")
+    return float(np.degrees(np.arccos(np.clip((zm / nm) @ (zf / nf), -1.0, 1.0))))
+
+
 def register_flip_rotation(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray,
                            flipped: np.ndarray, rate: float, phi0_main: float,
                            phi0_flip: float, halfwidth: float = 25.0):
@@ -179,7 +239,7 @@ def register_flip_rotation(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray
     flipped = np.asarray(flipped, bool)
     if (~flipped).sum() < 1 or flipped.sum() < 1 or not np.isfinite(phi0_flip):
         return None
-    D = Rot.from_euler('ZXZ', np.asarray(eulers, float), degrees=True)
+    D = dynamo_rotation(np.asarray(eulers, float))
     descrew = Rot.from_rotvec((-np.radians(rate * np.asarray(pos, float)))[:, None]
                               * np.asarray(axis, float)[None, :])
     Dt = descrew * D                                   # de-screwed orientations
@@ -214,12 +274,12 @@ def flipped_eulers(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray,
     eulers = np.atleast_2d(np.asarray(eulers, float))
     pos = np.atleast_1d(np.asarray(pos, float))
     to_majority = np.atleast_1d(np.asarray(to_majority, bool))
-    D = Rot.from_euler('ZXZ', eulers, degrees=True)
+    D = dynamo_rotation(eulers)
     descrew = Rot.from_rotvec((-np.radians(rate * pos))[:, None]
                               * np.asarray(axis, float)[None, :])
     Sarr = Rot.concatenate([S if t else S.inv() for t in to_majority])
     Dnew = descrew.inv() * Sarr * descrew * D
-    return Dnew.as_euler('ZXZ', degrees=True)
+    return rotation_to_dynamo_eulers(Dnew)
 
 
 def rot_flip_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
@@ -232,9 +292,9 @@ def rot_flip_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
     is unchanged.
     """
     eulers = np.atleast_2d(np.asarray(eulers, float))
-    D = Rot.from_euler('ZXZ', eulers, degrees=True)
+    D = dynamo_rotation(eulers)
     R = Rot.from_rotvec(np.pi * np.asarray(axis, float))   # 180 deg about the axis
-    return (R * D).as_euler('ZXZ', degrees=True)
+    return rotation_to_dynamo_eulers(R * D)
 
 
 def model_line(pos_span: float, phi0: float, rate: float,

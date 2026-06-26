@@ -29,6 +29,7 @@ from PyQt6 import QtCore, QtWidgets
 from scipy.spatial.transform import Rotation as Rot
 
 from plot_common import viridis_rgba
+from helix_geom import dynamo_rotation
 
 _HORIZONTAL = QtCore.Qt.Orientation.Horizontal
 
@@ -41,7 +42,10 @@ _MESH_RGBA = (0.55, 0.62, 0.78, 1.0)
 
 
 def _rotations(eulers: np.ndarray, invert: bool) -> Rot:
-    R = Rot.from_euler("ZXZ", np.asarray(eulers, float), degrees=True)
+    # Same convention as the roll measurement: raw Dynamo angles through the
+    # ArtiaX/ChimeraX placement transform (+ extrinsic zxz), so the triads match
+    # how ArtiaX places the density. The toggle still exposes the transpose escape.
+    R = dynamo_rotation(np.asarray(eulers, float))
     return R.inv() if invert else R
 
 

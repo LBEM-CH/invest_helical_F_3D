@@ -30,7 +30,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from helix_geom import fit_pose, roll_from_eulers, dominant_phase
+from helix_geom import fit_pose, roll_from_eulers, dominant_phase, polarity_dyad_angle
+
+# A real tilt flip is a head<->tail dyad: the two polarity groups' mean z-axes are
+# ~antiparallel (angle near 180). Below this the split is spurious (z ~perp to the
+# axis, polarity sign = noise) and gets no flipped register. See polarity_dyad_angle.
+MIN_DYAD_DEG = 150.0
 
 # Dynamo .tbl column indices (0-based).
 COL_TAG = 0
@@ -93,6 +98,11 @@ class Filament:
         main_pol = 1.0 if pol[main_in].sum() >= 0 else -1.0
         self.flipped = pol != main_pol
         self.delta = ((self.phi - (rate * self.pos + self.phi0) + 180) % 360) - 180
+        # Reject a spurious split: only a real head<->tail dyad (mean z-axes
+        # ~antiparallel) counts as a tilt flip; a noise split (z ~perp to the axis)
+        # has the two groups far from antiparallel -> no flipped register.
+        if self.flipped.sum() >= 3 and polarity_dyad_angle(self.eulers, self.flipped) < MIN_DYAD_DEG:
+            self.flipped = np.zeros(self.n, bool)
         self.phi0_flip = (dominant_phase(self.pos[self.flipped], self.phi[self.flipped], rate)[0]
                           if self.flipped.sum() >= 3 else float("nan"))
 
