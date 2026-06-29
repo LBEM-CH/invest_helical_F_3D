@@ -2,6 +2,7 @@ import numpy as np
 from numpy.linalg import norm
 from scipy.spatial.transform import Rotation as Rot
 from dynamo_table import load_dataset
+from helix_geom import dynamo_rotation
 
 PATH = "/mnt/storage/data3/users/wen-lu/tau/warp/position_8_5/dynamo/dynamo_project/abp_align_eo/"
 PX, RISE, TWIST = 19.36, 4.75, 0.7
@@ -18,7 +19,7 @@ offsets=[]; sang=[]; sdotn=[]
 for fil in ds.filaments:
     if not fil.fittable or fil.n < 12: continue
     n = fil.axis
-    D = Rot.from_euler('ZXZ', fil.eulers, degrees=True)
+    D = dynamo_rotation(fil.eulers)
     z = D.as_matrix()[:, :, 2]
     pol = np.sign(z @ n)
     maj = pol == np.sign(np.sum(pol)); minr = ~maj

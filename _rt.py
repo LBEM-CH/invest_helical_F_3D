@@ -3,6 +3,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 from PyQt6 import QtWidgets
 from dynamo_table import load_dataset
+from helix_geom import dynamo_rotation
 from selection_store import SelectionStore
 from plot_common import ModelParams
 from overview_window import OverviewWindow
@@ -18,7 +19,7 @@ def polflip_count():  # flipped segs whose polarity differs from original (= til
         for i,t in enumerate(f.tags):
             a=store.get_flip(int(t))
             if a is None: continue
-            z=Rot.from_euler('ZXZ',np.asarray(a,float),degrees=True).as_matrix()[:,2]@f.axis
+            z=dynamo_rotation(np.asarray(a,float)).as_matrix()[0][:,2]@f.axis
             if np.sign(z)!=np.sign(f.polarity[i]): c+=1
     return c
 ov.btn_autoflip.click()
