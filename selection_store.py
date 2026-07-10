@@ -21,6 +21,13 @@ import os
 
 from PyQt6 import QtCore
 
+# Bumped whenever the pose convention that turns stored angles into a rotation changes
+# (see helix_geom.dynamo_rotation). flipped_list.txt records the resulting angles, which
+# are convention-dependent, so a file written under a different convention can no longer
+# be trusted -- load_flips flags it and the GUI asks the user to regenerate. Same-version
+# files round-trip exactly, so the normal open/flip/close/reopen cycle is unaffected.
+FLIP_CONVENTION = "artiax-zxz-v1"
+
 
 class SelectionStore(QtCore.QObject):
     changed = QtCore.pyqtSignal()        # any add/remove/clear/load (either channel)
@@ -32,10 +39,16 @@ class SelectionStore(QtCore.QObject):
         self.autosave = autosave
         self._marked: set[int] = set()
         self._flips: dict[int, tuple] = {}      # tag -> (tdrot, tilt, narot) new angles
+        self.flips_stale = False                # loaded flips written under another convention
+        # Reading the resume files must NOT write them back: opening the app is a
+        # read, and autosaving on load would rewrite (or, if a list parses empty,
+        # DELETE) the user's file. Suppress autosave for the initial load only.
+        self.autosave = False
         if os.path.exists(out_path):
             self.load(out_path)          # resume where we left off
         if os.path.exists(self.flip_path):
             self.load_flips(self.flip_path)
+        self.autosave = autosave
 
     # --- queries ---------------------------------------------------------
     def __contains__(self, tag: int) -> bool:
@@ -172,10 +185,15 @@ class SelectionStore(QtCore.QObject):
         """Load 'tag tdrot tilt narot tilt_flip rot_flip' per line (comments ok). Old
         4-column files (no flip-type columns) are read as a tilt flip (1 0)."""
         flips: dict[int, tuple] = {}
+        convention = None
         with open(path) as fh:
             for line in fh:
                 line = line.strip()
-                if not line or line.startswith("#"):
+                if line.startswith("#"):
+                    if "convention:" in line:
+                        convention = line.split("convention:", 1)[1].strip()
+                    continue
+                if not line:
                     continue
                 p = line.split()
                 if len(p) >= 6:
@@ -184,6 +202,9 @@ class SelectionStore(QtCore.QObject):
                 elif len(p) >= 4:
                     flips[int(float(p[0]))] = (1, 0, float(p[1]), float(p[2]), float(p[3]))
         self._flips = flips
+        # A file with no marker, or a different one, was written under another pose
+        # convention -- its angles can't be trusted (the GUI offers to regenerate).
+        self.flips_stale = bool(flips) and convention != FLIP_CONVENTION
         self._after_flip_change()
 
     def save_flips(self, path: str | None = None) -> None:
@@ -191,6 +212,7 @@ class SelectionStore(QtCore.QObject):
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             fh.write("# invest_helical_F_3D flip list.\n")
+            fh.write(f"# convention: {FLIP_CONVENTION}\n")
             fh.write("#   tdrot,tilt,narot = resulting Dynamo ZXZ angles (cols 7-9); "
                      "position (cols 24-26) unchanged.\n")
             fh.write("#   tilt_flip = 1 if the polarity (perpendicular-dyad) flip was "
@@ -202,6 +224,7 @@ class SelectionStore(QtCore.QObject):
                 tilt, rot, a1, a2, a3 = self._flips[tag]
                 fh.write(f"{tag}\t{a1:.4f}\t{a2:.4f}\t{a3:.4f}\t{tilt}\t{rot}\n")
         os.replace(tmp, path)
+        self.flips_stale = False         # just written in the current convention
 
     def _after_change(self) -> None:
         if self.autosave:

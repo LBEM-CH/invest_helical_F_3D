@@ -153,6 +153,25 @@ def roll_from_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
     return roll_about_axis(D, axis)
 
 
+def axis_tilt(eulers: np.ndarray, axis: np.ndarray, orient: bool = True) -> np.ndarray:
+    """Angle (deg, [0, 180]) between each pose's z-axis and the filament axis.
+
+    Pure geometry: the particle's pointing direction (pose z-axis) versus the
+    SVD-fitted filament axis. 0 = points along the axis, 180 = antiparallel (a
+    polarity / perpendicular-dyad flip), 90 = perpendicular (noise). Rate- and
+    roll-independent -- it only compares the pose to the coordinate-fit axis.
+
+    The SVD axis sign is arbitrary per filament, so `orient` points it toward the
+    MAJORITY pointing direction: the dominant register then reads ~0 and the flipped
+    minority ~180 CONSISTENTLY across filaments (without it, half would be inverted).
+    """
+    z = dynamo_rotation(np.asarray(eulers, float)).as_matrix()[:, :, 2]   # (N, 3) z-axes
+    d = z @ np.asarray(axis, float)
+    if orient and d.sum() < 0.0:            # majority points against the raw axis -> flip it
+        d = -d
+    return np.degrees(np.arccos(np.clip(d, -1.0, 1.0)))
+
+
 def fit_model(pos: np.ndarray, phi: np.ndarray, rate: float) -> dict:
     """Fit the screw phase to measured rolls, given the rate.
 

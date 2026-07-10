@@ -11,7 +11,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
 
-from helix_geom import roll_from_eulers
+from helix_geom import roll_from_eulers, axis_tilt, dynamo_rotation
 
 
 def effective_phi(fil, store) -> np.ndarray:
@@ -26,6 +26,28 @@ def effective_phi(fil, store) -> np.ndarray:
                 phi[i] = roll_from_eulers(np.asarray(ang, float)[None, :], fil.axis)[0]
     return phi
 
+
+def _oriented_axis(fil) -> np.ndarray:
+    """The filament axis flipped to point toward its ORIGINAL majority direction, so a
+    fixed reference survives per-segment calls (axis_tilt re-orients per call otherwise).
+    A committed flip then visibly moves a dot dark<->amber against this fixed axis."""
+    z = dynamo_rotation(np.asarray(fil.eulers, float)).as_matrix()[:, :, 2]
+    return np.asarray(fil.axis, float) * (-1.0 if (z @ fil.axis).sum() < 0 else 1.0)
+
+
+def effective_tilt(fil, store) -> np.ndarray:
+    """Tilt-to-axis angle per segment (deg, [0,180]) with committed flips applied: a
+    flipped tag reads the tilt of its stored (flipped) pose. Measured against the fixed
+    majority-oriented axis, so flipping a dark segment shows up as it turning amber."""
+    n = _oriented_axis(fil)
+    tilt = axis_tilt(fil.eulers, n, orient=False)
+    if fil.fittable and fil.axis is not None and store.flip_count():
+        for i, t in enumerate(fil.tags):
+            ang = store.get_flip(int(t))
+            if ang is not None:
+                tilt[i] = axis_tilt(np.asarray(ang, float)[None, :], n, orient=False)[0]
+    return tilt
+
 # A viridis-like colormap defined explicitly so we don't depend on matplotlib
 # (pyqtgraph's get('viridis') needs matplotlib/colorcet installed).
 _VIRIDIS = pg.ColorMap(
@@ -34,6 +56,35 @@ _VIRIDIS = pg.ColorMap(
 )
 MARK_COLOR = (220, 30, 30)          # red: marked for removal
 HILITE_PEN = pg.mkPen((255, 140, 0), width=2.5)   # orange ring: linked hover
+
+# Shared toolbar-button look. Mixing stylesheet-styled and native-default buttons in
+# one row makes them render at different heights (ragged toolbar); giving every button
+# the same padding + border + radius keeps the row aligned. Colored buttons layer their
+# own background on this SAME geometry (see helpers below) so heights still match.
+_BTN_GEOM = "padding: 3px 9px; border: 1px solid {bd}; border-radius: 3px;"
+PLAIN_BTN_QSS = (
+    "QPushButton { " + _BTN_GEOM.format(bd="#9aa3b0") + " background: #f3f4f6; } "
+    "QPushButton:hover { background: #e6ebf2; } "
+    "QPushButton:disabled { color: rgba(0,0,0,90); border-color: #cccccc; }")
+
+
+def color_button_qss(rgb, checked_rgb=None) -> str:
+    """Toolbar-button stylesheet tinted `rgb`, sharing PLAIN_BTN_QSS geometry so a
+    colored button lines up with the plain ones. `checked_rgb` styles the :checked
+    state of a checkable button (and leaves it neutral when unchecked)."""
+    if checked_rgb is None:
+        r, g, b = rgb
+        qss = ("QPushButton { " + _BTN_GEOM.format(bd=f"rgb({r},{g},{b})")
+               + f" background: rgb({r},{g},{b}); color: white; }} "
+               f"QPushButton:disabled {{ background: rgba({r},{g},{b},70); "
+               "color: rgba(255,255,255,150); border-color: #cccccc; }")
+    else:
+        cr, cg, cb = checked_rgb
+        qss = ("QPushButton { " + _BTN_GEOM.format(bd="#9aa3b0") + " background: #f3f4f6; } "
+               "QPushButton:hover { background: #e6ebf2; } "
+               f"QPushButton:checked {{ background: rgb({cr},{cg},{cb}); color: white; "
+               f"border-color: rgb({cr},{cg},{cb}); }}")
+    return qss
 
 
 def viridis_rgba(values: np.ndarray) -> np.ndarray:
@@ -52,6 +103,71 @@ def pos_brushes(pos: np.ndarray, marked_mask: np.ndarray):
     brushes = []
     for v, m in zip(norm, marked_mask):
         brushes.append(pg.mkBrush(MARK_COLOR) if m else pg.mkBrush(_VIRIDIS.map(float(v), mode="qcolor")))
+    return brushes
+
+
+# --- register ("tilt") coloring for the roll panels --------------------------
+# The XY maps can't show how far a segment's roll sits from the main helix
+# register, so the roll / residual plots encode it as color instead. Three
+# DEFINED bins (not a spectrum), keyed to |residual to the main model line|
+# folded into [0, 180]:
+#   on the main register (<= REG_ZONE)      -> dark  : the "good" angle, recedes
+#   ~180 off / flipped   (>= 180 - REG_ZONE) -> amber : strongest contrast, flip these
+#   anything between                         -> grey  : "doesn't matter" angles
+# Marked-for-removal still overrides to red. REG_ZONE is the on/off-register
+# tolerance (deg): a segment within it of the main line reads as on-register, within
+# it of 180 reads as flipped.
+REG_ZONE = 30.0
+_REG_MAIN = (40, 44, 58)            # near-black slate: on the main register
+_REG_FLIP = (240, 168, 0)           # amber: ~180 off -> the strongest-contrast "flip me" dots
+_REG_OFF = (162, 167, 176)          # muted grey: off-register but not 180 -> doesn't matter
+
+
+def register_brushes(resid: np.ndarray, marked_mask):
+    """One QBrush per point, colored by |residual to the main model line| (deg): dark on
+    the main register, amber at ~180 (flipped), muted grey between; red where marked."""
+    d = np.abs(((np.asarray(resid, float) + 180.0) % 360.0) - 180.0)   # fold to [0, 180]
+    brushes = []
+    for di, m in zip(d, marked_mask):
+        if m:
+            c = MARK_COLOR
+        elif di <= REG_ZONE:
+            c = _REG_MAIN
+        elif di >= 180.0 - REG_ZONE:
+            c = _REG_FLIP
+        else:
+            c = _REG_OFF
+        brushes.append(pg.mkBrush(*c))
+    return brushes
+
+
+# Continuous ramp for the geometric tilt angle (pose z-axis vs coordinate-fit filament
+# axis), across the SAME three anchors as the register bins: dark along the axis (0),
+# grey perpendicular (90), amber antiparallel/flipped (180). A smooth ramp (not bins)
+# so the raw distribution of tilts is visible.
+_TILT_MAP = pg.ColorMap([0.0, 0.5, 1.0], [_REG_MAIN, _REG_OFF, _REG_FLIP])
+
+# A segment "fits the tilt axis" (dark or amber) when its tilt is within TILT_ZONE of
+# 0 or 180; otherwise it is off-axis grey. Drives "exclude bad tilt" and gates flip-all.
+TILT_ZONE = 40.0
+
+
+def tilt_off_axis(tilt_deg: np.ndarray) -> np.ndarray:
+    """Boolean mask: True where the tilt is off-axis (grey) -- neither aligned (~0) nor
+    antiparallel (~180) within TILT_ZONE. `min(tilt, 180-tilt)` is the distance to the
+    nearer pole, so it's independent of the arbitrary axis-sign orientation."""
+    t = np.asarray(tilt_deg, float)
+    return np.minimum(t, 180.0 - t) > TILT_ZONE
+
+
+def tilt_brushes(tilt_deg: np.ndarray, marked_mask):
+    """One QBrush per point by tilt-to-axis angle in [0,180]: dark along the axis, grey
+    perpendicular, amber antiparallel (flipped); red where marked."""
+    t = np.clip(np.asarray(tilt_deg, float) / 180.0, 0.0, 1.0)
+    brushes = []
+    for ti, m in zip(t, marked_mask):
+        brushes.append(pg.mkBrush(MARK_COLOR) if m
+                       else pg.mkBrush(_TILT_MAP.map(float(ti), mode="qcolor")))
     return brushes
 
 

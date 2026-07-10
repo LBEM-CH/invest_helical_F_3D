@@ -21,8 +21,10 @@ from PyQt6 import QtCore, QtWidgets
 from dynamo_table import Dataset
 from detail_window import DetailWindow
 from helix_geom import (model_line, register_flip_rotation, flipped_eulers,
-                        rot_flip_eulers)
-from plot_common import ModelParams, ParamBar, effective_phi, pos_brushes
+                        rot_flip_eulers, axis_tilt)
+from plot_common import (ModelParams, ParamBar, effective_phi, effective_tilt,
+                        tilt_brushes, tilt_off_axis, TILT_ZONE, PLAIN_BTN_QSS,
+                        color_button_qss)
 from selection_store import SelectionStore
 
 _PANEL_W, _PANEL_H = 190, 150
@@ -58,9 +60,11 @@ class _MiniPanel:
 
     def restyle(self, store):
         marked = np.array([store.is_marked(t) for t in self.fil.tags], dtype=bool)
-        if self.fil.fittable and np.isfinite(self.fil.phi0):
-            self.scatter.setData(x=self.fil.pos, y=effective_phi(self.fil, store),
-                                 brush=pos_brushes(self.fil.pos, marked))
+        if self.fil.fittable and self.fil.axis is not None:
+            phi = effective_phi(self.fil, store)
+            tilt = effective_tilt(self.fil, store)   # flip-aware pose z-axis vs filament axis
+            self.scatter.setData(x=self.fil.pos, y=phi,
+                                 brush=tilt_brushes(tilt, marked))
         else:
             self.scatter.setData([])
         color = "#dc1e1e" if marked.any() else "#222222"
@@ -102,45 +106,57 @@ class OverviewWindow(QtWidgets.QMainWindow):
         # --- right: controls + tomogram XY map -------------------------------
         right = QtWidgets.QWidget()
         rlay = QtWidgets.QVBoxLayout(right)
-        top = QtWidgets.QHBoxLayout()
-        top.addWidget(ParamBar(params))
-        # tilt-flip / rot-flip are independent ON/OFF switches: checked applies that flip
-        # to every segment in its register zone, unchecked removes it. Separate because
-        # the 180° rot is only valid where the fibril has C2; tilt (polarity) is general.
+        # Two control rows so the XY map below gets full width: row 1 = helix params,
+        # row 2 = the flip / exclude actions. (One long row squeezed the map.)
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(ParamBar(params))
+        row1.addStretch(1)
+        rlay.addLayout(row1)
+        row2 = QtWidgets.QHBoxLayout()
+        # tilt-flip / rot-flip are independent ON/OFF switches. They act ONLY on the
+        # dark (axis-aligned) and amber (antiparallel) segments -- the ones that fit the
+        # filament tilt axis; grey off-axis segments are skipped as irrelevant.
         self.btn_tiltall = QtWidgets.QPushButton("tilt-flip all")
         self.btn_tiltall.setCheckable(True)
-        self.btn_tiltall.setToolTip("Switch: tilt-flip (polarity) every pink/both-register "
-                                    "segment onto black. Click again to remove all tilt flips.")
-        self.btn_tiltall.setStyleSheet(
-            "QPushButton { padding: 3px 9px; } "
-            "QPushButton:checked { background-color: rgb(235,64,170); color: white; }")
+        self.btn_tiltall.setToolTip("Switch: tilt-flip (polarity) every AMBER (antiparallel) "
+                                    "segment onto the dark axis-aligned majority. Click again "
+                                    "to remove all tilt flips. Grey off-axis segments ignored.")
+        self.btn_tiltall.setStyleSheet(color_button_qss(None, checked_rgb=(235, 64, 170)))
         self.btn_tiltall.toggled.connect(lambda on: self._toggle_all("tilt", on))
         self.btn_rotall = QtWidgets.QPushButton("rot-flip all")
         self.btn_rotall.setCheckable(True)
         self.btn_rotall.setToolTip("Switch: rot-flip (180° about axis) every blue/both-register "
-                                   "segment onto black. Use only where the fibril has C2. "
-                                   "Click again to remove all rot flips.")
-        self.btn_rotall.setStyleSheet(
-            "QPushButton { padding: 3px 9px; } "
-            "QPushButton:checked { background-color: rgb(25,55,200); color: white; }")
+                                   "dark/amber segment onto black. Use only where the fibril has "
+                                   "C2. Click again to remove all rot flips. Grey segments ignored.")
+        self.btn_rotall.setStyleSheet(color_button_qss(None, checked_rgb=(25, 55, 200)))
         self.btn_rotall.toggled.connect(lambda on: self._toggle_all("rot", on))
+        self.btn_badtilt = QtWidgets.QPushButton("exclude bad tilt")
+        self.btn_badtilt.setToolTip("Mark for removal every segment whose pose is neither "
+                                    "aligned nor antiparallel to its filament axis (off-axis "
+                                    "grey tilt). Leaves each filament with only dark + amber.")
+        self.btn_badtilt.setStyleSheet(color_button_qss((150, 75, 55)))
+        self.btn_badtilt.clicked.connect(self._exclude_bad_tilt)
         self.btn_autoexcl = QtWidgets.QPushButton("auto-exclude")
         self.btn_autoexcl.setToolTip("Mark for removal every segment whose (flipped) roll "
                                      "is more than ±20° off its black line. Run AFTER you've "
                                      "flipped — only the black line matters now.")
-        self.btn_autoexcl.setStyleSheet(
-            "QPushButton { background-color: rgb(200,40,40); color: white; "
-            "border-radius: 3px; padding: 3px 9px; }")
+        self.btn_autoexcl.setStyleSheet(color_button_qss((200, 40, 40)))
         self.btn_autoexcl.clicked.connect(self._auto_exclude)
         self.btn_clearsel = QtWidgets.QPushButton("clear selection")
         self.btn_clearsel.setToolTip("Clear all removal marks (unselect every segment).")
+        self.btn_clearsel.setStyleSheet(PLAIN_BTN_QSS)
         self.btn_clearsel.clicked.connect(lambda *_: self.store.clear())
-        top.addWidget(self.btn_tiltall)
-        top.addWidget(self.btn_rotall)
-        top.addWidget(self.btn_autoexcl)
-        top.addWidget(self.btn_clearsel)
-        top.addStretch(1)
-        rlay.addLayout(top)
+        self.btn_autofit = QtWidgets.QPushButton("auto-fit twist")
+        self.btn_autofit.setToolTip("Estimate the helix twist that best fits every "
+                                    "filament's roll at once (robust to outlier tubes), "
+                                    "then apply it to the live twist / rise.")
+        self.btn_autofit.setStyleSheet(color_button_qss((25, 110, 200)))
+        self.btn_autofit.clicked.connect(self._open_autofit)
+        for w in (self.btn_tiltall, self.btn_rotall, self.btn_badtilt,
+                  self.btn_autoexcl, self.btn_autofit, self.btn_clearsel):
+            row2.addWidget(w)
+        row2.addStretch(1)
+        rlay.addLayout(row2)
         self.status = QtWidgets.QLabel("hover a filament panel…")
         rlay.addWidget(self.status)
         map_glw = pg.GraphicsLayoutWidget()
@@ -167,6 +183,31 @@ class OverviewWindow(QtWidgets.QMainWindow):
         self.store.changed.connect(self._restyle_all)
         self.params.changed.connect(self._on_params)
         self._on_params()                              # initial model draw + ranges
+        self._refresh_title()                          # show marked count + stale flag now
+        # If the resume flips were written under an older pose convention, their cached
+        # angles can't be trusted -- warn once (after the window is up) so they get
+        # regenerated rather than silently misleading the display / auto-exclude.
+        if self.store.flip_count() and getattr(self.store, "flips_stale", False):
+            QtCore.QTimer.singleShot(0, self._warn_stale_flips)
+
+    def _warn_stale_flips(self):
+        # NON-MODAL: a blocking QMessageBox.warning() runs its own nested event loop,
+        # and over `ssh -XY` it can open behind / off-screen -> the app looks frozen
+        # ("the loop is always running"). show() on a non-modal box never blocks; the
+        # title bar (see _restyle_all) carries a persistent fallback indicator.
+        mb = QtWidgets.QMessageBox(
+            QtWidgets.QMessageBox.Icon.Warning,
+            "Flipped list is from an older convention",
+            f"{self.store.flip_count()} flips were loaded from flipped_list.txt, but the "
+            "file predates the current pose convention, so its angles may place segments "
+            "on the wrong register — and mislead auto-exclude.\n\n"
+            "Regenerate them: toggle “tilt-flip all” / “rot-flip all” here, or re-flip per "
+            "filament in a detail window. Saving any flip rewrites the file in the current "
+            "convention and clears this warning.",
+            QtWidgets.QMessageBox.StandardButton.Ok, self)
+        mb.setModal(False)
+        mb.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        mb.show()
 
     # --- map -----------------------------------------------------------------
     def _draw_map(self):
@@ -208,6 +249,13 @@ class OverviewWindow(QtWidgets.QMainWindow):
         self.detail.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.detail.show()
 
+    def _open_autofit(self, *_):
+        """Open the modeless auto-fit-twist dialog (imported lazily; keeps startup lean)."""
+        from twist_fit_dialog import TwistFitDialog
+        self.autofit = TwistFitDialog(self.ds, self.params, parent=self)
+        self.autofit.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.autofit.show()
+
     def _on_params(self):
         """Parameters changed: rescale to the new Angstrom span and refit overlays."""
         self.halfspan = self.ds.pos_halfspan
@@ -220,45 +268,65 @@ class OverviewWindow(QtWidgets.QMainWindow):
         a black-zone segment is never flipped; a blue-zone segment is a rot target; a
         pink-zone segment (and NOT also in the blue zone) is a tilt target. The both /
         purple register is NOT auto-flipped here -- only manually in the detail window.
-        Each toggle owns a single-bit state for its own disjoint zone."""
+        Each toggle owns a single-bit state for its own disjoint zone.
+
+        ON only flips segments that aren't already flipped onto their register (resume
+        files / manual flips stay put -- re-setting them is idempotent). OFF "resumes
+        everything": it clears EVERY flip of this register, not just the ones currently
+        in the target zone. Loaded flips can fall outside today's zone (they were saved
+        under different params), so a zone-only clear would strand them flipped and the
+        switch would never fully flip back."""
+        # OFF clears the whole register so "click again" reliably undoes the flip-all.
+        # tilt owns the pure (1, 0) state, rot the pure (0, 1) state; manual both-register
+        # (1, 1) flips belong to neither switch and are left untouched.
+        if not on:
+            want = (1, 0) if which == "tilt" else (0, 1)
+            clear = [t for t in self.store.flip_tags() if self.store.get_state(t) == want]
+            self.store.replace_flips({}, clear)
+            self.status.setText(f"{which}-flip all OFF: {len(clear)} {which} flips cleared")
+            return
         rate = self.ds.model_rate
         nset = 0
-        set_map, clear = {}, []
+        set_map = {}
         for f in self.ds.filaments:
-            if not (f.fittable and np.isfinite(f.phi0)):
+            if not (f.fittable and np.isfinite(f.phi0) and f.axis is not None):
                 continue
-            rb = ((f.phi - (rate * f.pos + f.phi0) + 180) % 360) - 180
-            in_black = np.abs(rb) <= zone
-            in_blue = np.abs(((rb - 180 + 180) % 360) - 180) <= zone
+            # tilt colour of every segment (pose z-axis vs the fitted axis).
+            tilt_ang = axis_tilt(f.eulers, f.axis)
             if which == "rot":
-                target = in_blue & ~in_black
+                # rot still works on the roll registers, restricted to the on-axis
+                # (dark/amber) segments -- off-axis grey ones are irrelevant.
+                on_axis = ~tilt_off_axis(tilt_ang)
+                rb = ((f.phi - (rate * f.pos + f.phi0) + 180) % 360) - 180
+                in_black = np.abs(rb) <= zone
+                in_blue = np.abs(((rb - 180 + 180) % 360) - 180) <= zone
+                target = in_blue & ~in_black & on_axis
                 if not target.any():
                     continue
                 pose, bits = rot_flip_eulers(f.eulers, f.axis), (0, 1)
-            else:                                          # tilt
-                if not np.isfinite(f.phi0_flip):
-                    continue
-                rp = ((f.phi - (rate * f.pos + f.phi0_flip) + 180) % 360) - 180
-                target = (np.abs(rp) <= zone) & ~in_black & ~in_blue   # priority: blue beats pink
+            else:                                          # tilt: flip AMBER -> dark
+                # Pure polarity view: target the AMBER (antiparallel) segments -- the
+                # minority pointing the wrong way -- and flip them onto the dark
+                # (axis-aligned) majority. No roll / register (magenta-line) criterion
+                # anymore -- tilt colour alone decides.
+                target = tilt_ang >= 180.0 - TILT_ZONE
                 if not target.any():
                     continue
                 S = register_flip_rotation(f.eulers, f.pos, f.axis, f.flipped, rate,
                                            f.phi0, f.phi0_flip)
                 if S is None:
                     continue
-                pose = flipped_eulers(f.eulers, f.pos, f.axis, rate, S, np.ones(f.n, bool))
+                # Reverse polarity per segment: S maps the flipped group -> main, S^-1 the
+                # main group -> flipped. to_majority=f.flipped picks the right direction for
+                # each so EVERY targeted (amber) segment ends up axis-aligned (dark).
+                pose = flipped_eulers(f.eulers, f.pos, f.axis, rate, S, f.flipped)
                 bits = (1, 0)
             for i in np.where(target)[0]:
                 t = int(f.tags[i])
-                if on:
-                    set_map[t] = (bits[0], bits[1], tuple(pose[i]))
-                    nset += 1
-                else:
-                    clear.append(t)
-        self.store.replace_flips(set_map, clear)
-        self.status.setText(f"{which}-flip all {'ON' if on else 'OFF'}: "
-                            f"{nset if on else 0} {which}-zone segments "
-                            f"{'flipped' if on else 'cleared'}")
+                set_map[int(t)] = (bits[0], bits[1], tuple(pose[i]))
+                nset += 1
+        self.store.replace_flips(set_map)
+        self.status.setText(f"{which}-flip all ON: {nset} {which}-zone segments flipped")
 
     def _auto_exclude(self, *_):
         """Mark for removal every segment whose effective (flipped) roll is more than
@@ -279,9 +347,31 @@ class OverviewWindow(QtWidgets.QMainWindow):
             f"auto-exclude: marked {len(bad)} segments >±{int(zone)}° off black "
             f"across {nfil} filaments  ({self.store.count()} total marked)")
 
+    def _exclude_bad_tilt(self, *_):
+        """Mark for removal every segment whose pose is off-axis (grey tilt): neither
+        aligned nor antiparallel to its filament's fitted axis. Leaves each filament
+        with only its dark (aligned) and amber (antiparallel) segments -- the ones the
+        polarity/rot flips can act on. (*_ swallows the clicked bool.)"""
+        bad, nfil = [], 0
+        for f in self.ds.filaments:
+            if not (f.fittable and f.axis is not None):
+                continue                                   # no axis fit -> no tilt to test
+            off = tilt_off_axis(axis_tilt(f.eulers, f.axis))
+            bad.extend(int(t) for t in f.tags[off])
+            nfil += 1
+        self.store.add(bad)
+        self.status.setText(
+            f"exclude bad tilt: marked {len(bad)} off-axis (grey) segments "
+            f"across {nfil} filaments  ({self.store.count()} total marked)")
+
+    def _refresh_title(self):
+        stale = " — ⚠ flipped_list.txt outdated: regenerate flips" if (
+            self.store.flip_count() and getattr(self.store, "flips_stale", False)) else ""
+        self.setWindowTitle(
+            f"invest_helical_F_3D — {self.ds.fmt} tomo {self.ds.tomo} — "
+            f"{len(self.ds.filaments)} filaments — {self.store.count()} marked{stale}")
+
     def _restyle_all(self):
         for p in self.panels:
             p.restyle(self.store)
-        self.setWindowTitle(
-            f"invest_helical_F_3D — {self.ds.fmt} tomo {self.ds.tomo} — "
-            f"{len(self.ds.filaments)} filaments — {self.store.count()} marked")
+        self._refresh_title()

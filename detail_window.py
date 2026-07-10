@@ -24,9 +24,10 @@ from PyQt6 import QtCore, QtWidgets
 
 from dynamo_table import Filament
 from helix_geom import (model_line, register_flip_rotation, flipped_eulers,
-                        rot_flip_eulers)
+                        rot_flip_eulers, axis_tilt)
 from plot_common import (HILITE_PEN, ModelParams, ParamBar, SelectableViewBox,
-                         effective_phi, pos_brushes)
+                         effective_phi, effective_tilt, pos_brushes, tilt_brushes,
+                         tilt_off_axis, PLAIN_BTN_QSS, color_button_qss)
 
 _DASH = pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine)
 _FLIP_RGB = (235, 64, 170)                           # pink: the tilt-flip (polarity) register
@@ -39,13 +40,9 @@ _DASH_ROT = pg.mkPen(_ROT_RGB, width=1.6, style=QtCore.Qt.PenStyle.DashLine)
 
 
 def _color_button(btn, rgb):
-    """Tint a button to match its dashed register line (muted when disabled)."""
-    r, g, b = rgb
-    btn.setStyleSheet(
-        f"QPushButton {{ background-color: rgb({r},{g},{b}); color: white; "
-        f"border: 1px solid rgb({r},{g},{b}); border-radius: 3px; padding: 3px 9px; }}"
-        f"QPushButton:disabled {{ background-color: rgba({r},{g},{b},70); "
-        f"color: rgba(255,255,255,150); }}")
+    """Tint a button to match its dashed register line (muted when disabled), using
+    the shared toolbar geometry so it lines up with the plain buttons."""
+    btn.setStyleSheet(color_button_qss(rgb))
 _TRAJ_PEN = pg.mkPen((80, 80, 80, 160), width=1.6)   # grey iteration trails (thicker, antialiased)
 
 
@@ -119,9 +116,12 @@ class _Panel:
     def set_data(self, x, y, tags):
         self.x, self.y, self.tags = np.asarray(x), np.asarray(y), np.asarray(tags)
 
-    def restyle(self, store):
+    def restyle(self, store, brushes=None):
+        """Recolor + resize the dots. `brushes` (one per point) overrides the default
+        viridis-by-position fill -- the roll / residual panels pass register colors."""
         marked = np.array([store.is_marked(t) for t in self.tags], dtype=bool)
-        brushes = pos_brushes(self.x, marked)
+        if brushes is None:
+            brushes = pos_brushes(self.x, marked)
         spots = [dict(pos=(float(x), float(y)), data=int(t), brush=b,
                       size=(14 if m else 10))
                  for x, y, t, b, m in zip(self.x, self.y, self.tags, brushes, marked)]
@@ -165,6 +165,12 @@ class DetailWindow(QtWidgets.QMainWindow):
         self.btn_all.clicked.connect(lambda: self.store.add(self.fil.tags.tolist()))
         self.btn_clear = QtWidgets.QPushButton("Clear filament")
         self.btn_clear.clicked.connect(lambda: self.store.remove(self.fil.tags.tolist()))
+        self.btn_badtilt = QtWidgets.QPushButton("exclude bad tilt")
+        self.btn_badtilt.setToolTip("Mark for removal every off-axis (grey) segment in this "
+                                    "filament — pose neither aligned nor antiparallel to the "
+                                    "filament axis. Leaves only dark + amber.")
+        self.btn_badtilt.setStyleSheet(color_button_qss((150, 75, 55)))
+        self.btn_badtilt.clicked.connect(self._exclude_bad_tilt)
         self.btn_home = QtWidgets.QPushButton("Home (reset view)")
         self.btn_home.clicked.connect(self._reset_view)
         self.btn_back = QtWidgets.QPushButton("← Back to overview")
@@ -182,6 +188,7 @@ class DetailWindow(QtWidgets.QMainWindow):
         self.btn_flipmode.setToolTip(
             "Selection re-flips segments (polarity dyad) instead of marking them for "
             "removal. Rubber-band to stage, then press Flip.")
+        self.btn_flipmode.setStyleSheet(color_button_qss(None, checked_rgb=(218, 135, 30)))
         self.btn_flipmode.toggled.connect(self._set_mode)
         self.btn_doflip = QtWidgets.QPushButton("tilt-flip")
         self.btn_doflip.setToolTip("Tilt-flip the staged segments: the polarity dyad "
@@ -214,7 +221,11 @@ class DetailWindow(QtWidgets.QMainWindow):
             "to see how each segment's roll converged from its starting value")
         self.chk_traj.toggled.connect(self._refit)
         for w in (self.btn_all, self.btn_clear, self.btn_home, self.btn_back, self.btn_3d,
-                  self.btn_flipmode, self.btn_doflip, self.btn_rotflip, self.btn_resume):
+                  self.btn_resume):
+            w.setStyleSheet(PLAIN_BTN_QSS)            # uniform height with the colored buttons
+        for w in (self.btn_all, self.btn_clear, self.btn_badtilt, self.btn_home, self.btn_back,
+                  self.btn_3d, self.btn_flipmode, self.btn_doflip, self.btn_rotflip,
+                  self.btn_resume):
             bar.addWidget(w)
         bar.addWidget(self.chk_traj)
         bar.addWidget(ParamBar(params))
@@ -412,15 +423,17 @@ class DetailWindow(QtWidgets.QMainWindow):
             self.flip_staged.clear()
             self._draw_flip_markers(self.p1.y)
         self.statusBar().showMessage(
-            "FLIP mode: left-drag = stage, then tilt-flip / rot-flip (they compose; "
-            "click the same flip twice to undo). Right-drag = unflip." if flip_on else
+            "FLIP mode: left-drag = stage, then tilt-flip / rot-flip (commits and clears "
+            "the selection). Right-drag = unstage (won't unflip); click a flipped dot or "
+            "Resume to undo." if flip_on else
             "left-drag = mark   |   right-drag = unmark   |   scroll = zoom   |   click = toggle one")
 
     def _toggle_flip(self, which):
         """Toggle the tilt- or rot-bit of each staged segment's (tilt, rot) state. The
-        pose is recomputed from the ORIGINAL angles for the resulting state, so flips
-        compose AND the same flip twice returns to the original. Staged set is kept, so
-        the buttons can be clicked repeatedly on the same selection."""
+        pose is recomputed from the ORIGINAL angles for the resulting state. Committing
+        FREES the selection (clears the staged set), so the next rubber-band picks a
+        fresh group instead of re-flipping the one just committed. Re-select the same
+        segments to compose a second flip (e.g. tilt then rot) or to undo."""
         if not self.flip_staged:
             return
         fil = self.fil
@@ -451,7 +464,8 @@ class DetailWindow(QtWidgets.QMainWindow):
                 clear.append(t)
             elif (tt, rt) in pose:                     # tilt states need S; skip if absent
                 set_map[t] = (tt, rt, tuple(pose[(tt, rt)][k]))
-        self.store.replace_flips(set_map, clear)       # one save+signal; staged kept
+        self.flip_staged.clear()                       # commit frees the selection (point 3/4)
+        self.store.replace_flips(set_map, clear)       # one save+signal -> refresh redraws markers
 
     def _commit_flip(self):
         """Tilt-flip (polarity dyad): toggle the tilt bit of the staged segments."""
@@ -470,6 +484,14 @@ class DetailWindow(QtWidgets.QMainWindow):
             self.store.unflip(here)                    # -> changed -> _refresh_data
         else:
             self._draw_flip_markers(self.p1.y)
+
+    def _exclude_bad_tilt(self, *_):
+        """Mark for removal this filament's off-axis (grey) segments: pose neither
+        aligned nor antiparallel to the fitted axis. Leaves only dark + amber."""
+        if not (self.fil.fittable and self.fil.axis is not None):
+            return
+        off = tilt_off_axis(axis_tilt(self.fil.eulers, self.fil.axis))
+        self.store.add([int(t) for t in self.fil.tags[off]])
 
     def _reset_view(self):
         for p in self.panels:
@@ -531,15 +553,26 @@ class DetailWindow(QtWidgets.QMainWindow):
         if not tags:
             return
         if self.mode == "flip":
+            # Right-drag only UNSTAGES (point 5): it must not flip committed segments
+            # back. To undo a flip, click a flipped dot or press Resume.
             self.flip_staged.difference_update(int(t) for t in tags)
-            committed = [t for t in tags if self.store.is_flipped(int(t))]
-            if committed:
-                self.store.unflip(committed)       # -> changed -> _refresh_data
-            else:
-                self._draw_flip_markers(self.p1.y)
+            self._draw_flip_markers(self.p1.y)
         else:
             self.store.remove(tags)
 
     def _restyle_all(self):
-        for p in self.panels:
-            p.restyle(self.store)
+        # All three panels -- roll (p1), residual (p2) AND the XY map (p3) -- are colored
+        # by the geometric tilt angle (pose z-axis vs the coordinate-fit filament axis):
+        # dark along the axis, amber antiparallel (flipped), grey perpendicular. Sharing
+        # the color lets the map show the dark/amber split the roll plots reveal.
+        if self.fil.fittable and self.fil.axis is not None:
+            tilt = effective_tilt(self.fil, self.store)   # flip-aware: flipped dots turn amber
+            marked = np.array([self.store.is_marked(int(t)) for t in self.fil.tags], dtype=bool)
+            brushes = tilt_brushes(tilt, marked)
+            self.p1.restyle(self.store, brushes)
+            self.p2.restyle(self.store, brushes)
+            self.p3.restyle(self.store, brushes)
+        else:
+            self.p1.restyle(self.store)
+            self.p2.restyle(self.store)
+            self.p3.restyle(self.store)
