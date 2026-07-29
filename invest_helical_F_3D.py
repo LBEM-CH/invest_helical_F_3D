@@ -92,8 +92,11 @@ def parse_args(argv=None):
     ap.add_argument("--no-temp", action="store_true",
                     help="do not write temp.tbl into a Dynamo folder")
     ap.add_argument("--iteration-paths", action="store_true",
-                    help="scan earlier iterations and draw per-segment convergence "
-                         "trails (off by default)")
+                    help="scan earlier iterations: enables the overview's iteration "
+                         "slider (replot every panel as of any iteration, with the "
+                         "twist measured there) and the detail window's per-segment "
+                         "convergence trails. Off by default -- it reads every "
+                         "iteration's table/star up front")
     glgrp = ap.add_mutually_exclusive_group()
     glgrp.add_argument("--gl", action="store_true",
                        help="force-enable the OpenGL 3D view (local display / VirtualGL)")

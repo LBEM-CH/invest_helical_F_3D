@@ -27,9 +27,13 @@ from helix_geom import (model_line, register_flip_rotation, flipped_eulers,
                         rot_flip_eulers, axis_tilt)
 from plot_common import (HILITE_PEN, ModelParams, ParamBar, SelectableViewBox,
                          effective_phi, effective_tilt, pos_brushes, tilt_brushes,
-                         tilt_off_axis, PLAIN_BTN_QSS, color_button_qss)
+                         tilt_off_axis, TILT_ZONE, PLAIN_BTN_QSS, color_button_qss,
+                         category_visible_mask, tilt_counts, tilt_category,
+                         CAT_DARK, CAT_BAD, CAT_AMBER)
 
 _DASH = pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine)
+_DARK_RGB = (40, 44, 58)                             # matches the tilt "dark" (axis-aligned) dots
+_AMBER_RGB = (240, 168, 0)                           # matches the tilt "amber" (antiparallel) dots
 _FLIP_RGB = (235, 64, 170)                           # pink: the tilt-flip (polarity) register
 _ROT_RGB = (25, 55, 200)                             # dark blue: the rot-flip (+180) register
 _BOTH_RGB = (140, 50, 200)                           # purple: tilt+rot (both) register
@@ -116,15 +120,19 @@ class _Panel:
     def set_data(self, x, y, tags):
         self.x, self.y, self.tags = np.asarray(x), np.asarray(y), np.asarray(tags)
 
-    def restyle(self, store, brushes=None):
+    def restyle(self, store, brushes=None, visible=None):
         """Recolor + resize the dots. `brushes` (one per point) overrides the default
-        viridis-by-position fill -- the roll / residual panels pass register colors."""
+        viridis-by-position fill -- the roll / residual panels pass register colors.
+        `visible` (bool per point, same order as self.tags) hides unchecked tilt
+        categories; None shows all."""
         marked = np.array([store.is_marked(t) for t in self.tags], dtype=bool)
         if brushes is None:
             brushes = pos_brushes(self.x, marked)
         spots = [dict(pos=(float(x), float(y)), data=int(t), brush=b,
                       size=(14 if m else 10))
-                 for x, y, t, b, m in zip(self.x, self.y, self.tags, brushes, marked)]
+                 for i, (x, y, t, b, m) in enumerate(
+                     zip(self.x, self.y, self.tags, brushes, marked))
+                 if visible is None or visible[i]]
         self.scatter.setData(spots=spots)
 
     def show_hover(self, idx):
@@ -159,8 +167,9 @@ class DetailWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         outer = QtWidgets.QVBoxLayout(central)
 
-        # --- toolbar ---------------------------------------------------------
-        bar = QtWidgets.QHBoxLayout()
+        # --- toolbar (two rows: select/remove/navigate above, flip/params below) --
+        bar1 = QtWidgets.QHBoxLayout()
+        bar2 = QtWidgets.QHBoxLayout()
         self.btn_all = QtWidgets.QPushButton("Select all in filament")
         self.btn_all.clicked.connect(lambda: self.store.add(self.fil.tags.tolist()))
         self.btn_clear = QtWidgets.QPushButton("Clear filament")
@@ -171,6 +180,18 @@ class DetailWindow(QtWidgets.QMainWindow):
                                     "filament axis. Leaves only dark + amber.")
         self.btn_badtilt.setStyleSheet(color_button_qss((150, 75, 55)))
         self.btn_badtilt.clicked.connect(self._exclude_bad_tilt)
+        # remove-by-color: mark every DARK (axis-aligned) or every AMBER (antiparallel)
+        # segment for removal in one click -- the same tilt colors the dots show.
+        self.btn_rmdark = QtWidgets.QPushButton("remove dark")
+        self.btn_rmdark.setToolTip("Mark for removal every DARK (axis-aligned) segment in "
+                                   "this filament — the ones on the main tilt register.")
+        self.btn_rmdark.setStyleSheet(color_button_qss(_DARK_RGB))
+        self.btn_rmdark.clicked.connect(lambda: self._remove_color("dark"))
+        self.btn_rmamber = QtWidgets.QPushButton("remove amber")
+        self.btn_rmamber.setToolTip("Mark for removal every AMBER (antiparallel) segment in "
+                                    "this filament — the polarity-flipped register.")
+        self.btn_rmamber.setStyleSheet(color_button_qss(_AMBER_RGB))
+        self.btn_rmamber.clicked.connect(lambda: self._remove_color("amber"))
         self.btn_home = QtWidgets.QPushButton("Home (reset view)")
         self.btn_home.clicked.connect(self._reset_view)
         self.btn_back = QtWidgets.QPushButton("← Back to overview")
@@ -223,17 +244,31 @@ class DetailWindow(QtWidgets.QMainWindow):
         for w in (self.btn_all, self.btn_clear, self.btn_home, self.btn_back, self.btn_3d,
                   self.btn_resume):
             w.setStyleSheet(PLAIN_BTN_QSS)            # uniform height with the colored buttons
-        for w in (self.btn_all, self.btn_clear, self.btn_badtilt, self.btn_home, self.btn_back,
-                  self.btn_3d, self.btn_flipmode, self.btn_doflip, self.btn_rotflip,
-                  self.btn_resume):
-            bar.addWidget(w)
-        bar.addWidget(self.chk_traj)
-        bar.addWidget(ParamBar(params))
+        # Row 1: select + remove-by-color + navigation.
+        for w in (self.btn_all, self.btn_clear, self.btn_badtilt, self.btn_rmdark,
+                  self.btn_rmamber, self.btn_home, self.btn_back, self.btn_3d):
+            bar1.addWidget(w)
+        # Show/hide each tilt category; the label carries this filament's live count.
+        bar1.addWidget(QtWidgets.QLabel("show:"))
+        self.chk_show = {}
+        for code, name in ((CAT_DARK, "dark"), (CAT_AMBER, "amber"), (CAT_BAD, "bad-tilt")):
+            cb = QtWidgets.QCheckBox(name)
+            cb.setChecked(True)
+            cb.toggled.connect(self._restyle_all)
+            self.chk_show[code] = cb
+            bar1.addWidget(cb)
+        bar1.addStretch(1)
+        # Row 2: flip machinery + iteration paths + the live twist/rise/pixel bar + readout.
+        for w in (self.btn_flipmode, self.btn_doflip, self.btn_rotflip, self.btn_resume):
+            bar2.addWidget(w)
+        bar2.addWidget(self.chk_traj)
+        bar2.addWidget(ParamBar(params))
         self.readout = QtWidgets.QLabel("hover a segment…")
         self.readout.setMinimumWidth(340)
-        bar.addWidget(self.readout)
-        bar.addStretch(1)
-        outer.addLayout(bar)
+        bar2.addWidget(self.readout)
+        bar2.addStretch(1)
+        outer.addLayout(bar1)
+        outer.addLayout(bar2)
 
         # --- plots -----------------------------------------------------------
         glw = pg.GraphicsLayoutWidget()
@@ -487,11 +522,29 @@ class DetailWindow(QtWidgets.QMainWindow):
 
     def _exclude_bad_tilt(self, *_):
         """Mark for removal this filament's off-axis (grey) segments: pose neither
-        aligned nor antiparallel to the fitted axis. Leaves only dark + amber."""
+        aligned nor antiparallel to the fitted axis. Leaves only dark + amber. Uses the
+        SAME flip-aware effective tilt the dots are colored by, so it marks exactly the
+        grey dots shown (raw eulers would miss committed flips)."""
         if not (self.fil.fittable and self.fil.axis is not None):
             return
-        off = tilt_off_axis(axis_tilt(self.fil.eulers, self.fil.axis))
+        off = tilt_off_axis(effective_tilt(self.fil, self.store))
         self.store.add([int(t) for t in self.fil.tags[off]])
+
+    def _remove_color(self, which):
+        """Mark for removal every segment of ONE tilt color in this filament and add it
+        to the remove list: `dark` = axis-aligned (tilt ≈ 0), `amber` = antiparallel
+        (tilt ≈ 180). Uses the SAME flip-aware effective tilt the dots are colored by,
+        so what you remove matches what you see (a committed flip moves a dot dark↔amber
+        and this follows it)."""
+        if not (self.fil.fittable and self.fil.axis is not None):
+            return
+        tilt = effective_tilt(self.fil, self.store)          # flip-aware, [0, 180]
+        sel = (tilt <= TILT_ZONE) if which == "dark" else (tilt >= 180.0 - TILT_ZONE)
+        tags = [int(t) for t in self.fil.tags[sel]]
+        self.store.add(tags)
+        self.statusBar().showMessage(
+            f"removed {len(tags)} {which} segment(s) → remove list "
+            f"({self.store.count()} total marked)")
 
     def _reset_view(self):
         for p in self.panels:
@@ -500,10 +553,16 @@ class DetailWindow(QtWidgets.QMainWindow):
     def _on_hover(self, scatter, points, ev=None):
         if len(points) == 0:
             return
-        idx = points[0].index()
+        # Map by TAG, not by points[0].index(): when a tilt category is hidden the
+        # scatter holds only the visible subset, so its spot index no longer lines up
+        # with the full fil.tags / panel arrays. The spot's data (tag) is stable.
+        t = int(points[0].data())
+        matches = np.where(self.fil.tags.astype(int) == t)[0]
+        if matches.size == 0:
+            return
+        idx = int(matches[0])
         for p in self.panels:
             p.show_hover(idx)
-        t = int(self.fil.tags[idx])
         if self.view3d is not None:                # mirror the hover onto the 3D scene
             self.view3d.highlight_tags([t])
         flags = [s for s, on in (("MARKED", self.store.is_marked(t)),
@@ -560,6 +619,25 @@ class DetailWindow(QtWidgets.QMainWindow):
         else:
             self.store.remove(tags)
 
+    def _show(self):
+        """(dark_on, bad_on, amber_on) from the view checkboxes, ordered by CAT_*."""
+        return (self.chk_show[CAT_DARK].isChecked(),
+                self.chk_show[CAT_BAD].isChecked(),
+                self.chk_show[CAT_AMBER].isChecked())
+
+    def _update_cat_labels(self, tilt):
+        """Put this filament's live segment count of each tilt category on its checkbox,
+        plus the cos-weighted score (Σ|cos tilt|) for dark and amber -- the weight each
+        register casts in the majority vote (the larger is the dominant polarity)."""
+        nd, nb, na = tilt_counts(tilt)
+        cat = tilt_category(tilt)
+        acos = np.abs(np.cos(np.radians(np.asarray(tilt, float))))
+        dark_cos = float(acos[cat == CAT_DARK].sum())
+        amber_cos = float(acos[cat == CAT_AMBER].sum())
+        self.chk_show[CAT_DARK].setText(f"dark ({nd}, cos {dark_cos:.1f})")
+        self.chk_show[CAT_AMBER].setText(f"amber ({na}, cos {amber_cos:.1f})")
+        self.chk_show[CAT_BAD].setText(f"bad-tilt ({nb})")
+
     def _restyle_all(self):
         # All three panels -- roll (p1), residual (p2) AND the XY map (p3) -- are colored
         # by the geometric tilt angle (pose z-axis vs the coordinate-fit filament axis):
@@ -569,9 +647,11 @@ class DetailWindow(QtWidgets.QMainWindow):
             tilt = effective_tilt(self.fil, self.store)   # flip-aware: flipped dots turn amber
             marked = np.array([self.store.is_marked(int(t)) for t in self.fil.tags], dtype=bool)
             brushes = tilt_brushes(tilt, marked)
-            self.p1.restyle(self.store, brushes)
-            self.p2.restyle(self.store, brushes)
-            self.p3.restyle(self.store, brushes)
+            vis = category_visible_mask(tilt, self._show())   # hide unchecked categories
+            self._update_cat_labels(tilt)                     # show live per-category counts
+            self.p1.restyle(self.store, brushes, vis)
+            self.p2.restyle(self.store, brushes, vis)
+            self.p3.restyle(self.store, brushes, vis)
         else:
             self.p1.restyle(self.store)
             self.p2.restyle(self.store)

@@ -57,6 +57,43 @@ model line — that's what you mark.
   wanders never settled. Toggle it off in the toolbar; solid line (vs the dashed model),
   beneath the dots.
 
+### Iteration slider (overview)
+An **iteration slider** under the toolbar scrubs *every* panel back through the refinement.
+Reading all the iterations takes a few seconds, so it is not done at startup: point the tool
+at the refinement **job folder** and press **load iterations** next to the slider (or launch
+with `--iteration-paths` to have it ready immediately). If the slider reads `n/a` with no
+load button, the path has no history — you are pointing at a single `.star` rather than the
+job folder that holds `run_it*_data.star`.
+
+Drag it and the whole grid redraws as the rolls were at
+that iteration; the readout beside it reports the **twist measured from the rolls on screen**
+(the same robust per-filament slope vote the auto-fit uses), against iteration 0 and the
+final value — so you can watch, and quantify, the screw flattening as refinement proceeds.
+This is the intended way to see a measured twist decay across refinement. Two distinct
+causes produce that decay, and the job's `note.txt` tells you which one you have:
+
+- **Symmetry applied** (`--helix` *without* `--ignore_helical_symmetry`) — the case in
+  *Scope and known limitations* (`docs/pose_and_roll.md` §8): rot is defined only modulo
+  the screw operator, so the accumulated phase is folded and the slope is attenuated.
+- **Symmetry ignored, rot unrestrained** (`--ignore_helical_symmetry` with `--sigma_rot 0`)
+  — nothing ties consecutive segments' rot to their position, so the screw present in the
+  picking geometry simply washes out toward zero.
+
+Either way the late-iteration twist is not the filament's twist; iteration 0 is the honest
+one.
+
+Coordinates never move between iterations — only the poses — so positions, tags and the
+fitted axis are shared, and only the roll and its colouring change. Notes:
+
+- **Marks apply to segments, not to iterations.** *auto-exclude* and *exclude bad tilt*
+  judge the iteration on screen, so marking at several iterations simply accumulates into
+  the one remove list. That is expected and supported.
+- **Flips are disabled off the final iteration** — a flip rewrites the pose, which is only
+  meaningful on the working set. Press **final** first. For the same reason, committed
+  flips are shown only at the final iteration.
+- Opening a filament (clicking a panel) always shows the **final** iteration; the detail
+  window's own *Iteration paths* trail is the per-segment view of the same history.
+
 ### Live helix controls
 Both windows carry **twist / rise / pixel size** spin boxes (rise in Å, pixel size in
 Å/px). Retune any of them and every model overlay refits instantly at real Å scale; the two
@@ -174,8 +211,9 @@ Options: `--tomo` (Dynamo col-20 id or RELION `_rlnTomoName`; else only/first or
 `--twist` (°/subunit), `--rise` (Å/subunit), `--pixelsize` (Å/px; RELION default from the
 star optics, Dynamo default 7.92), `--map` (reference average `.mrc`/`.em` for the 3D
 density overlay), `--cols` (overview columns), `--out` (remove-list path; point it somewhere
-writable if the input sits on read-only storage), `--no-temp`. Twist, rise and pixel size
-are also live in the GUI.
+writable if the input sits on read-only storage), `--no-temp`, `--iteration-paths` (read
+every iteration up front; enables the overview iteration slider and the detail-window
+convergence trails). Twist, rise and pixel size are also live in the GUI.
 
 Requires Python 3.9+. `--relion` additionally needs the `eulerangles` package (included in
 both `environment.yml` and `requirements.txt`).

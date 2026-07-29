@@ -74,6 +74,17 @@ CONF_MIN = 0.30                    # min median linearity to trust the fit
 AGREE_MIN = 0.50                   # min weighted fraction agreeing to trust the fit
 CI_MAX = 0.50                      # deg: max bootstrap CI half-width to call it reliable
 
+# --- is the twist DETERMINED by the data at all? -----------------------------
+# Filament agreement is NOT enough: every filament can share the same systematic
+# limitation and agree on a value the data does not actually pin down (verified on
+# tau Class3D job062 — 79/81 filaments agreed on -0.47, bootstrap CI +/-0.09, but the
+# fit-quality-vs-twist profile was FLAT from -0.15 to -1.0, so -0.47 and -1.0 are
+# indistinguishable there). So we also profile the fit quality across twist and take
+# its PROMINENCE (peak above floor) and WIDTH as the honest determination/uncertainty.
+PROFILE_DROP = 0.05                # interval = twists fitting within 5% of the peak
+PROM_MIN = 0.30                    # min profile prominence for the twist to be determined
+WIDTH_MAX = 0.30                   # deg: max profile half-width to call it reliable
+
 
 @dataclass
 class FilFit:
@@ -91,8 +102,11 @@ class FilFit:
 class FitStats:
     """Statistics that say whether the consensus twist is trustworthy."""
     peak_concentration: float     # median filament linearity, [0, 1]
-    prominence: float             # weighted fraction of filaments in the consensus cluster
+    prominence: float             # fit-quality profile peak above its floor — is twist DETERMINED?
     ci95: float                   # bootstrap 95% half-width on the consensus twist (deg)
+    interval_lo: float            # profile-likelihood interval: twists fitting within PROFILE_DROP
+    interval_hi: float            # of the peak. THE honest uncertainty (bootstrap alone lies).
+    profile_peak: float           # twist at the profile maximum (deg/subunit)
     vote_spread: float            # robust std (1.4826*MAD) of per-filament votes (deg)
     vote_lo: float                # 2.5th percentile of per-filament votes (deg)
     vote_hi: float                # 97.5th percentile of per-filament votes (deg)
@@ -193,7 +207,9 @@ def _median_span(filaments):
 
 
 # --- statistics + verdict ----------------------------------------------------
-def _compute_stats(votes, weights, confs, inlier, consensus, median_span, n_flipped):
+def _compute_stats(votes, weights, confs, inlier, consensus, median_span, n_flipped,
+                   prof_peak=float("nan"), prom=float("nan"),
+                   lo=float("nan"), hi=float("nan")):
     votes = np.asarray(votes, float)
     w = np.asarray(weights, float) * inlier
     within = np.abs(votes - consensus) <= AGREE_TOL
@@ -214,12 +230,28 @@ def _compute_stats(votes, weights, confs, inlier, consensus, median_span, n_flip
     else:
         ci95 = float("nan")
 
+    # The honest +/-: the profile-likelihood half-width, or the bootstrap CI, whichever
+    # is LARGER. Bootstrap alone under-reports when all filaments share a systematic
+    # limitation (they agree on a value the data does not determine).
+    half = (hi - lo) / 2.0 if np.isfinite(lo) and np.isfinite(hi) else float("nan")
     ci_ok = not np.isfinite(ci95) or ci95 <= CI_MAX
-    reliable = (agree_frac >= AGREE_MIN) and (med_conf >= CONF_MIN) and ci_ok
+    prom_ok = not np.isfinite(prom) or prom >= PROM_MIN
+    width_ok = not np.isfinite(half) or half <= WIDTH_MAX
+    # The slope estimate must lie inside the range the data actually supports. If the
+    # dynamic fit lands outside the profile interval the two measurements contradict
+    # each other -- never report that as reliable.
+    agrees_profile = (not np.isfinite(lo)) or (lo <= consensus <= hi)
+    reliable = (agree_frac >= AGREE_MIN) and (med_conf >= CONF_MIN) and ci_ok \
+        and prom_ok and width_ok and agrees_profile
     if reliable:
-        verdict = "RELIABLE — filament slopes agree on one twist."
+        verdict = "RELIABLE — the data pins the twist and the filaments agree."
     else:
         why = []
+        if not prom_ok:
+            why.append(f"the data barely distinguishes twists (profile prominence "
+                       f"{prom:.2f}) — the twist is NOT determined by these rolls")
+        if not width_ok:
+            why.append(f"any twist in [{lo:+.2f}, {hi:+.2f}]° fits essentially as well")
         if agree_frac < AGREE_MIN:
             why.append(f"filament slopes disagree (only {agree_frac*100:.0f}% within "
                        f"±{AGREE_TOL:.1f}° of consensus)")
@@ -227,17 +259,54 @@ def _compute_stats(votes, weights, confs, inlier, consensus, median_span, n_flip
             why.append(f"rolls are not linear (median linearity {med_conf:.2f})")
         if not ci_ok:
             why.append(f"unstable consensus (bootstrap CI ±{ci95:.2f}°)")
+        if not agrees_profile:
+            why.append(f"the slope fit ({consensus:+.2f}°) falls OUTSIDE the range the "
+                       f"data supports [{lo:+.2f}, {hi:+.2f}]° — the two disagree")
         hint = ""
-        if np.isfinite(median_span):
-            hint = (f" Filaments span ~{median_span:.0f} Å; if that is short vs one helical "
-                    "period the slope is weakly determined — collect longer tubes, or check "
-                    "the pose convention.")
+        if not (prom_ok and width_ok) and np.isfinite(median_span):
+            hint = (f" Filaments span only ~{median_span:.0f} Å — too little turn to fix the "
+                    "slope. Trust a real-space/3D symmetry search over this fit.")
         verdict = "UNRELIABLE — " + "; ".join(why) + "." + hint
 
-    return FitStats(peak_concentration=med_conf, prominence=agree_frac, ci95=ci95,
+    return FitStats(peak_concentration=med_conf, prominence=prom, ci95=ci95,
+                    interval_lo=lo, interval_hi=hi, profile_peak=prof_peak,
                     vote_spread=vote_spread, vote_lo=vlo, vote_hi=vhi,
                     agree_frac=agree_frac, median_span=median_span,
                     n_flipped=n_flipped, reliable=reliable, verdict=verdict)
+
+
+def _quality_profile(fils, twists, rise):
+    """Mean per-filament roll concentration as a function of candidate twist.
+
+    This is the profile likelihood of the twist: how well the WHOLE dataset's rolls
+    line up on a screw of that slope. Its peak height above the floor says whether
+    the twist is determined at all, and the width of its top says how precisely —
+    which filament-to-filament agreement cannot tell you (they can agree on a value
+    the data does not pin down). Vectorised over the twist grid.
+    """
+    rates = twists / rise
+    tot = np.zeros_like(twists)
+    n = 0
+    for f in fils:
+        pos = f.pos.astype(float)
+        phi = f.phi.astype(float)
+        if len(pos) < 2:
+            continue
+        res = np.radians(phi[:, None] - rates[None, :] * pos[:, None])   # (segs, grid)
+        tot += np.abs(np.exp(1j * res).sum(0)) / len(pos)
+        n += 1
+    return tot / max(n, 1)
+
+
+def _profile_stats(twists, profile):
+    """(peak_twist, prominence, lo, hi) of the fit-quality profile."""
+    k = int(np.argmax(profile))
+    peak = float(profile[k])
+    off = np.abs(twists - twists[k]) > 1.0
+    floor = float(np.median(profile[off])) if off.any() else float(profile.min())
+    prom = peak - floor
+    inside = twists[profile >= peak - PROFILE_DROP * prom] if prom > 0 else twists
+    return float(twists[k]), prom, float(inside.min()), float(inside.max())
 
 
 def _vote_density(twists, votes, weights, inlier):
@@ -293,9 +362,14 @@ def _assemble(rise, twists, votes, confs, spans, ids, nn, nflip, fils, mode,
 
     twist = _wmedian(votes[inlier], weights[inlier])
     rate = twist / rise
+    # Profile the fit quality across twist: does the data actually DETERMINE the twist?
+    profile = _quality_profile(fils, twists, rise)
+    prof_peak, prom, lo, hi = _profile_stats(twists, profile)
     stats = _compute_stats(votes, weights, confs, inlier, twist,
-                           _median_span(fils), nflip)
-    unc = stats.ci95 if np.isfinite(stats.ci95) else scale
+                           _median_span(fils), nflip, prof_peak, prom, lo, hi)
+    half = (hi - lo) / 2.0 if np.isfinite(lo) and np.isfinite(hi) else float("nan")
+    cands = [v for v in (stats.ci95, half) if np.isfinite(v)]
+    unc = max(cands) if cands else scale       # honest +/-: widest of the two measures
     curve = _vote_density(twists, votes, weights, inlier)
 
     per_fil = [FilFit(fid=ids[i], twist=float(votes[i]), peakscore=float(confs[i]),
@@ -311,6 +385,29 @@ def _assemble(rise, twists, votes, confs, spans, ids, nn, nflip, fils, mode,
 
 
 # --- public API --------------------------------------------------------------
+def quick_twist(filaments, rise: float, rot_flip: bool = False) -> float:
+    """Just the consensus twist (deg/subunit), for live readouts.
+
+    Same measurement as fit_fixed_rise -- per-filament dynamic slope votes, MAD
+    outlier rejection, span*confidence-weighted median -- but WITHOUT the quality
+    profile and bootstrap, which dominate that function's cost (the profile alone
+    evaluates every filament against a 1201-point twist grid). Use this where a
+    number is wanted per interaction and the reliability verdict is not; use
+    fit_fixed_rise when the answer is going to be applied or trusted.
+    """
+    got = _fit_votes(filaments, rise, rot_flip)
+    if got is None:
+        return float("nan")
+    _, votes, confs, spans = got[:4]
+    weights = spans * np.clip(confs, 1e-3, None)
+    med = _wmedian(votes, weights)
+    scale = max(1.4826 * float(np.median(np.abs(votes - med))), _MAD_FLOOR)
+    inlier = np.abs(votes - med) <= _MAD_K * scale
+    if not inlier.any():
+        inlier[:] = True
+    return _wmedian(votes[inlier], weights[inlier])
+
+
 def fit_fixed_rise(filaments, rise: float, working_rate: float = None,
                    rot_flip: bool = False, tmin: float = TWIST_MIN,
                    tmax: float = TWIST_MAX, n_grid: int = N_GRID) -> TwistFitResult:

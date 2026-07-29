@@ -10,7 +10,7 @@ notebook stay numerically identical.
 
 Per filament we:
   * project the 3D segment coordinates onto the SVD-fitted axis -> real signed
-    position along the filament, with the middle (centroid) at 0,
+    position along the filament, with the centroid (mean of all segments) at 0,
   * carry the reference x-axis through each particle's pose and read the azimuth
     (roll) about the filament axis,
   * compare that roll to the known screw  roll = RATE*pos + phi0, where
@@ -85,13 +85,24 @@ def rotation_to_dynamo_eulers(R: Rot) -> np.ndarray:
 
 
 def axis_and_pos(xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Fit the filament axis through the middle and project to a 1D position.
+    """Least-squares fit of the filament axis through ALL segments, and the 1D
+    position of each along it.
+
+    Two separate things, easily conflated:
+      * the ORIGIN is the centroid -- the mean of all N coordinates. It is a
+        computed point, NOT the middle segment, and generally coincides with no
+        segment at all. It only sets where pos = 0, and that choice barely matters:
+        a shift along the axis moves every pos by a constant, which the free
+        per-filament phase (dominant_phase) absorbs entirely.
+      * the DIRECTION is the first right singular vector of the centred
+        coordinates -- a least-squares fit through all N points, not the line
+        between the two end segments. Every segment contributes to it.
 
     xyz : (N, 3) coordinates (any single length unit).
     Returns (n, pos): n = unit axis (head<->tail, sign arbitrary), pos = signed
     arc-length along it (same unit as xyz) with 0 at the centroid.
     """
-    c = xyz.mean(0)                       # middle of the filament
+    c = xyz.mean(0)                       # centroid of all segments (not a segment)
     _, _, vt = np.linalg.svd(xyz - c)
     n = vt[0]                             # principal axis = head<->tail direction
     pos = (xyz - c) @ n                   # real signed position along axis
@@ -153,7 +164,52 @@ def roll_from_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:
     return roll_about_axis(D, axis)
 
 
-def axis_tilt(eulers: np.ndarray, axis: np.ndarray, orient: bool = True) -> np.ndarray:
+# Half-angle (deg) of the "on-axis" cone: a segment is a clean dark/amber (axis-
+# aligned or antiparallel) member only within this cone (+/- TILT_CONE) of either
+# pole; the rest are near-perpendicular noise ("bad everywhere"). Also the cone the
+# majority-polarity vote sums within. Shared by the dark/amber coloring
+# (plot_common.TILT_ZONE), so the color bands and the vote use one width.
+TILT_CONE = 30.0
+
+
+def majority_axis_sign(cos_tilt: np.ndarray, cone: float = TILT_CONE) -> float:
+    """+1 / -1 to orient a filament axis so its MAJORITY polarity reads ~0 deg (dark).
+
+    cos_tilt : (N,) cos of each pose's tilt to the RAW axis (= pose z-axis . axis),
+               so its sign is which pole the segment points toward.
+
+    Two-stage: (1) keep only segments within `cone` deg of EITHER pole -- a near-
+    perpendicular pose (|cos| small) means the filament is bad there and its polarity
+    sign is noise, so it is dropped. (2) Among those, the majority is the sign of the
+    summed projection Σcos (the "good tilt angle" direction). The cone bounds |cos| to
+    [cos(cone), 1] (>= 0.87 at 30 deg), so the two poles no longer cancel across
+    perpendicular noise and the cos-weighted vote is stable. +1 if nothing is on-axis.
+    """
+    c = np.asarray(cos_tilt, float)
+    on = np.abs(c) >= np.cos(np.radians(cone))       # within `cone` of 0 or 180 deg
+    if not on.any():
+        return 1.0
+    return 1.0 if c[on].sum() >= 0.0 else -1.0       # cos-weighted vote, in-cone only
+
+
+def oriented_axis(eulers: np.ndarray, axis: np.ndarray,
+                  cone: float = TILT_CONE) -> np.ndarray:
+    """The filament axis flipped to point toward its MAJORITY pose direction.
+
+    The SVD axis sign is arbitrary, so this pins it once (cone-gated cos-weighted
+    vote, see majority_axis_sign) and callers reuse the result instead of letting
+    axis_tilt re-orient per call. Fixing it matters wherever tilts from DIFFERENT
+    pose sets are compared against one filament -- committed flips (plot_common) and
+    the per-iteration views -- since a per-call vote could swing between them and
+    make the whole filament's dark/amber coloring jump.
+    """
+    z = dynamo_rotation(np.asarray(eulers, float)).as_matrix()[:, :, 2]
+    axis = np.asarray(axis, float)
+    return axis * majority_axis_sign(z @ axis, cone)
+
+
+def axis_tilt(eulers: np.ndarray, axis: np.ndarray, orient: bool = True,
+              cone: float = TILT_CONE) -> np.ndarray:
     """Angle (deg, [0, 180]) between each pose's z-axis and the filament axis.
 
     Pure geometry: the particle's pointing direction (pose z-axis) versus the
@@ -162,13 +218,14 @@ def axis_tilt(eulers: np.ndarray, axis: np.ndarray, orient: bool = True) -> np.n
     roll-independent -- it only compares the pose to the coordinate-fit axis.
 
     The SVD axis sign is arbitrary per filament, so `orient` points it toward the
-    MAJORITY pointing direction: the dominant register then reads ~0 and the flipped
-    minority ~180 CONSISTENTLY across filaments (without it, half would be inverted).
+    MAJORITY pointing direction (cone-gated cos-weighted vote -- see
+    majority_axis_sign): the dominant register then reads ~0 and the flipped minority
+    ~180 CONSISTENTLY across filaments (without it, half would be inverted).
     """
     z = dynamo_rotation(np.asarray(eulers, float)).as_matrix()[:, :, 2]   # (N, 3) z-axes
     d = z @ np.asarray(axis, float)
-    if orient and d.sum() < 0.0:            # majority points against the raw axis -> flip it
-        d = -d
+    if orient:
+        d = d * majority_axis_sign(d, cone)   # Σcos within the cone (drops perpendicular)
     return np.degrees(np.arccos(np.clip(d, -1.0, 1.0)))
 
 
@@ -270,13 +327,24 @@ def register_flip_rotation(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray
         keep = gi[d <= halfwidth]
         return Dt[keep if keep.size else gi].mean()    # fallback: whole group
 
-    # The natural rotation between the two registers -- NOT snapped to 180/perp:
-    # for some filaments the pink<->black relation is a rotation about an axis far
-    # from perpendicular (even near-parallel to the filament axis), and forcing it
-    # perpendicular breaks tilt-flip. Exact involution / sequence-closure is handled
-    # by the caller tracking the discrete flip STATE (recomputing each pose from the
-    # original), not by squaring this operator -- so S only has to map pink -> black.
-    return mean_near(~flipped, phi0_main) * mean_near(flipped, phi0_flip).inv()
+    S = mean_near(~flipped, phi0_main) * mean_near(flipped, phi0_flip).inv()
+
+    # Snap S to an EXACT 180-deg rotation about an axis PERPENDICULAR to the filament
+    # axis -- the definition of a polarity dyad. Such a rotation maps every pose's tilt
+    # theta -> 180 - theta EXACTLY, so it turns dark<->amber and leaves grey as grey: a
+    # tilt-flip can then NEVER push a good (dark/amber) segment into the off-axis (grey)
+    # band. The raw mean-to-mean S is only ~180/perpendicular (a few deg off), which
+    # leaked ~4% of near-boundary segments into grey (breaking "exclude bad tilt" after
+    # a flip). Keeping the perpendicular DIRECTION of S preserves its pink->black roll
+    # mapping (verified: roll residual unchanged). Only snap when S is predominantly
+    # perpendicular (a genuine dyad); a near-axis relation is left raw (see history).
+    axis = np.asarray(axis, float)
+    rv = np.asarray(S.as_rotvec(), float)
+    perp = rv - (rv @ axis) * axis                     # component orthogonal to the axis
+    perp_norm = np.linalg.norm(perp)
+    if perp_norm > abs(rv @ axis):                     # more perpendicular than parallel
+        S = Rot.from_rotvec(np.pi * perp / perp_norm)  # exact 180 about that perp axis
+    return S
 
 
 def flipped_eulers(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray,

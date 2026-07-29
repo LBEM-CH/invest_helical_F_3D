@@ -162,11 +162,26 @@ def image_pixel_size(path: str) -> float | None:
 
 def _alignment_eulers(t: _Table) -> np.ndarray:
     """(N,3) zyz alignment angles: the refined _rlnAngle* if present, else the
-    assumed _rlnAngle*Prior (RELION's preassumed pose)."""
+    assumed _rlnAngle*Prior (RELION's preassumed pose).
+
+    RELION semantics (authoritative — do not "optimise" away from this):
+      * The final pose of a refined particle is  _rlnTomoSubtomogram* x _rlnAngle*.
+        Once _rlnAngle* exists it IS the answer and the prior is irrelevant.
+      * _rlnAngle*Prior is only the CENTRE OF THE SEARCH for that iteration — never
+        an output. It is used here solely as the fallback for the very first iteration
+        (and pre-refinement stars), which carry no _rlnAngle*.
+
+    Tempting trap, tried and rejected: forcing the fixed (0, 90, 0) extraction prior
+    instead of _rlnAngle* makes the roll plot look "cleaner" (MSA Class3D job082:
+    linearity 0.66 -> 0.95) — but that is an artefact. It reproduces the PICKING
+    geometry, which is smooth by construction, and throws away the refined alignment
+    the structure is actually built from. A subset of segments genuinely not lying on
+    the model line is REAL (a Class3D contains poorly-aligned particles), not a bug.
+    """
     if t.has("rlnAngleRot") and t.has("rlnAngleTilt") and t.has("rlnAnglePsi"):
-        names = ("rlnAngleRot", "rlnAngleTilt", "rlnAnglePsi")
+        names = ("rlnAngleRot", "rlnAngleTilt", "rlnAnglePsi")     # the refined answer
     else:
-        names = ("rlnAngleRotPrior", "rlnAngleTiltPrior", "rlnAnglePsiPrior")
+        names = ("rlnAngleRotPrior", "rlnAngleTiltPrior", "rlnAnglePsiPrior")  # it000 only
     return np.column_stack([t.col(nm) for nm in names])
 
 
@@ -217,6 +232,11 @@ def load_particles(path: str, tomo_name: str | None):
     pid = t.col("rlnTomoParticleId", dtype=float).astype(int)[sel]
     xyz = np.column_stack([t.col("rlnCoordinateX"), t.col("rlnCoordinateY"),
                            t.col("rlnCoordinateZ")])[sel]
+    # NOTE: the refined _rlnOrigin*Angst shifts are deliberately NOT applied. They are
+    # defined in the SUBTOMOGRAM frame, not the tomogram frame, so subtracting them from
+    # tomogram coordinates is invalid -- and it measurably hurts: on the paired MSA
+    # control (Class3D job082, truth ~+1.4) applying them drops linearity 0.95 -> 0.69
+    # and the twist +1.15 -> +0.59. The geometric screw lives in the original picks.
     subtomo = np.column_stack([t.col("rlnTomoSubtomogramRot"),
                                t.col("rlnTomoSubtomogramTilt"),
                                t.col("rlnTomoSubtomogramPsi")])[sel]

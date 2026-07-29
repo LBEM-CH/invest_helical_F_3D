@@ -7,45 +7,79 @@ author: Wen-Lu Chung
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
 
-from helix_geom import roll_from_eulers, axis_tilt, dynamo_rotation
+from helix_geom import roll_from_eulers, axis_tilt, oriented_axis, TILT_CONE
 
 
-def effective_phi(fil, store) -> np.ndarray:
+def _flip_overrides(fil, store):
+    """(indices, angles) of this filament's committed flips as arrays, or (None, None).
+
+    Returning them batched lets the effective_* helpers rebuild ALL flipped poses in
+    one vectorised rotation instead of one scipy Rotation per flipped segment -- these
+    run on every restyle (and on every step of the iteration slider), so a per-segment
+    loop over a heavily flipped filament was the dominant redraw cost.
+    """
+    if not (fil.fittable and fil.axis is not None and store.flip_count()):
+        return None, None
+    idx, ang = [], []
+    for i, t in enumerate(fil.tags):
+        a = store.get_flip(int(t))
+        if a is not None:
+            idx.append(i)
+            ang.append(a)
+    if not idx:
+        return None, None
+    return np.asarray(idx, int), np.asarray(ang, float)
+
+
+def effective_phi(fil, store, use_flips: bool = True) -> np.ndarray:
     """Roll per segment with committed flips applied: a flipped tag reads the roll of
     its stored (flipped) angles, everything else its original roll. Shared by the
-    overview and detail plots so both show flips the same way."""
+    overview and detail plots so both show flips the same way.
+
+    use_flips=False returns the raw roll. The stored flip angles are derived from the
+    FINAL poses, so they are meaningless against an earlier iteration's poses -- the
+    iteration views pass False rather than mixing the two.
+    """
     phi = fil.phi.astype(float).copy()
-    if fil.fittable and fil.axis is not None and store.flip_count():
-        for i, t in enumerate(fil.tags):
-            ang = store.get_flip(int(t))
-            if ang is not None:
-                phi[i] = roll_from_eulers(np.asarray(ang, float)[None, :], fil.axis)[0]
+    if not use_flips:
+        return phi
+    idx, ang = _flip_overrides(fil, store)
+    if idx is not None:
+        phi[idx] = roll_from_eulers(ang, fil.axis)
     return phi
 
 
 def _oriented_axis(fil) -> np.ndarray:
-    """The filament axis flipped to point toward its ORIGINAL majority direction, so a
-    fixed reference survives per-segment calls (axis_tilt re-orients per call otherwise).
-    A committed flip then visibly moves a dot dark<->amber against this fixed axis."""
-    z = dynamo_rotation(np.asarray(fil.eulers, float)).as_matrix()[:, :, 2]
-    return np.asarray(fil.axis, float) * (-1.0 if (z @ fil.axis).sum() < 0 else 1.0)
+    """The filament axis flipped toward its majority pose direction -- a FIXED
+    reference, so tilts measured from different pose sets (committed flips, earlier
+    iterations) stay comparable and a flip visibly moves a dot dark<->amber.
+
+    Prefers the value pinned at load from the final poses (Filament.axis_oriented);
+    falls back to computing it for filament-likes that lack the field."""
+    n = getattr(fil, "axis_oriented", None)
+    if n is not None:
+        return np.asarray(n, float)
+    return oriented_axis(fil.eulers, fil.axis)
 
 
-def effective_tilt(fil, store) -> np.ndarray:
+def effective_tilt(fil, store, use_flips: bool = True) -> np.ndarray:
     """Tilt-to-axis angle per segment (deg, [0,180]) with committed flips applied: a
     flipped tag reads the tilt of its stored (flipped) pose. Measured against the fixed
-    majority-oriented axis, so flipping a dark segment shows up as it turning amber."""
+    majority-oriented axis, so flipping a dark segment shows up as it turning amber.
+    use_flips=False gives the raw tilt (see effective_phi)."""
     n = _oriented_axis(fil)
     tilt = axis_tilt(fil.eulers, n, orient=False)
-    if fil.fittable and fil.axis is not None and store.flip_count():
-        for i, t in enumerate(fil.tags):
-            ang = store.get_flip(int(t))
-            if ang is not None:
-                tilt[i] = axis_tilt(np.asarray(ang, float)[None, :], n, orient=False)[0]
+    if not use_flips:
+        return tilt
+    idx, ang = _flip_overrides(fil, store)
+    if idx is not None:
+        tilt[idx] = axis_tilt(ang, n, orient=False)
     return tilt
 
 # A viridis-like colormap defined explicitly so we don't depend on matplotlib
@@ -87,6 +121,23 @@ def color_button_qss(rgb, checked_rgb=None) -> str:
     return qss
 
 
+@functools.lru_cache(maxsize=4096)
+def shared_brush(rgb) -> "pg.mkBrush":
+    """A CACHED QBrush per colour — never build one per point.
+
+    pyqtgraph's symbol atlas keys rendered symbols on brush/pen object IDENTITY
+    (SymbolAtlas._keys stamps an _id on each instance), so a fresh mkBrush per point
+    makes every point a unique symbol: it re-rasterises the whole scatter on every
+    redraw and grows the atlas without bound. Handing back the SAME object for the
+    same colour collapses a panel to its handful of real symbols. Measured on a 2982-
+    segment tomogram: ~134k renderSymbol calls per 45 redraws -> a few dozen, and the
+    iteration slider from ~133 ms/step to ~4 ms/step.
+
+    Callers must not mutate the returned brush.
+    """
+    return pg.mkBrush(*rgb)
+
+
 def viridis_rgba(values: np.ndarray) -> np.ndarray:
     """(N, 4) float RGBA: viridis across the min..max of `values` (e.g. position)."""
     v = np.asarray(values, float)
@@ -96,14 +147,22 @@ def viridis_rgba(values: np.ndarray) -> np.ndarray:
 
 
 def pos_brushes(pos: np.ndarray, marked_mask: np.ndarray):
-    """One QBrush per point: viridis by position, or red where marked."""
+    """One QBrush per point: viridis by position, or red where marked.
+
+    The ramp is quantised to 256 steps so the brushes come from the shared cache --
+    a continuous ramp would otherwise give every point its own symbol in pyqtgraph's
+    atlas (see shared_brush). 256 steps is finer than the eye resolves on a dot."""
     p = np.asarray(pos, float)
     rng = np.ptp(p)
     norm = (p - p.min()) / rng if rng > 0 else np.zeros_like(p)
-    brushes = []
+    out = []
     for v, m in zip(norm, marked_mask):
-        brushes.append(pg.mkBrush(MARK_COLOR) if m else pg.mkBrush(_VIRIDIS.map(float(v), mode="qcolor")))
-    return brushes
+        if m:
+            out.append(shared_brush(MARK_COLOR))
+        else:
+            c = _VIRIDIS.map(round(float(v) * 255) / 255.0, mode="byte")
+            out.append(shared_brush(tuple(int(x) for x in c)))
+    return out
 
 
 # --- register ("tilt") coloring for the roll panels --------------------------
@@ -137,19 +196,26 @@ def register_brushes(resid: np.ndarray, marked_mask):
             c = _REG_FLIP
         else:
             c = _REG_OFF
-        brushes.append(pg.mkBrush(*c))
+        brushes.append(shared_brush(c))
     return brushes
 
 
-# Continuous ramp for the geometric tilt angle (pose z-axis vs coordinate-fit filament
-# axis), across the SAME three anchors as the register bins: dark along the axis (0),
-# grey perpendicular (90), amber antiparallel/flipped (180). A smooth ramp (not bins)
-# so the raw distribution of tilts is visible.
-_TILT_MAP = pg.ColorMap([0.0, 0.5, 1.0], [_REG_MAIN, _REG_OFF, _REG_FLIP])
+# The geometric tilt angle (pose z-axis vs coordinate-fit filament axis) is shown as
+# exactly THREE discrete colors -- one per on-screen category, matching the view
+# checkboxes -- never a continuous ramp:
+#   dark  (<= TILT_ZONE of 0)          axis-aligned  (majority / "good" polarity)
+#   amber (>= 180 - TILT_ZONE)         antiparallel  (the tilt-flipped register)
+#   grey  (in between)                 off-axis      (bad tilt: neither)
+# Marked-for-removal overrides to red -> 4 colors total (red is the selection).
+CAT_DARK, CAT_BAD, CAT_AMBER = 0, 1, 2
+CAT_NAMES = ("dark", "bad-tilt", "amber")
+_CAT_RGB = (_REG_MAIN, _REG_OFF, _REG_FLIP)          # indexed by CAT_*
 
 # A segment "fits the tilt axis" (dark or amber) when its tilt is within TILT_ZONE of
 # 0 or 180; otherwise it is off-axis grey. Drives "exclude bad tilt" and gates flip-all.
-TILT_ZONE = 40.0
+# Same cone the majority-polarity vote counts within (helix_geom.TILT_CONE), so the
+# dark/amber membership and the majority orientation stay consistent.
+TILT_ZONE = TILT_CONE
 
 
 def tilt_off_axis(tilt_deg: np.ndarray) -> np.ndarray:
@@ -160,15 +226,39 @@ def tilt_off_axis(tilt_deg: np.ndarray) -> np.ndarray:
     return np.minimum(t, 180.0 - t) > TILT_ZONE
 
 
+def tilt_category(tilt_deg: np.ndarray) -> np.ndarray:
+    """(N,) int CAT_* per segment: CAT_DARK (tilt <= TILT_ZONE), CAT_AMBER (tilt >=
+    180 - TILT_ZONE), else CAT_BAD (off-axis grey). Pass the oriented/effective tilt."""
+    t = np.asarray(tilt_deg, float)
+    cat = np.full(t.shape, CAT_BAD, int)
+    cat[t <= TILT_ZONE] = CAT_DARK
+    cat[t >= 180.0 - TILT_ZONE] = CAT_AMBER
+    return cat
+
+
+def tilt_counts(tilt_deg: np.ndarray):
+    """(n_dark, n_bad, n_amber): how many segments fall in each tilt category."""
+    cat = tilt_category(tilt_deg)
+    return (int((cat == CAT_DARK).sum()), int((cat == CAT_BAD).sum()),
+            int((cat == CAT_AMBER).sum()))
+
+
+def category_visible_mask(tilt_deg: np.ndarray, show) -> np.ndarray:
+    """(N,) bool: keep a segment iff its category's checkbox is on.
+    show = (dark_on, bad_on, amber_on), ordered by CAT_*."""
+    cat = tilt_category(tilt_deg)
+    if cat.size == 0:
+        return np.zeros(0, bool)
+    s = (bool(show[0]), bool(show[1]), bool(show[2]))
+    return np.array([s[c] for c in cat], bool)
+
+
 def tilt_brushes(tilt_deg: np.ndarray, marked_mask):
-    """One QBrush per point by tilt-to-axis angle in [0,180]: dark along the axis, grey
-    perpendicular, amber antiparallel (flipped); red where marked."""
-    t = np.clip(np.asarray(tilt_deg, float) / 180.0, 0.0, 1.0)
-    brushes = []
-    for ti, m in zip(t, marked_mask):
-        brushes.append(pg.mkBrush(MARK_COLOR) if m
-                       else pg.mkBrush(_TILT_MAP.map(float(ti), mode="qcolor")))
-    return brushes
+    """One QBrush per point: exactly 3 DISCRETE tilt colors -- dark (axis-aligned),
+    grey (off-axis bad tilt), amber (antiparallel) -- red where marked. No ramp."""
+    cat = tilt_category(tilt_deg)
+    return [shared_brush(MARK_COLOR) if m else shared_brush(_CAT_RGB[c])
+            for c, m in zip(cat, marked_mask)]
 
 
 class SelectableViewBox(pg.ViewBox):

@@ -22,6 +22,7 @@ live -- Dataset.set_params() recomputes just that cheap part across filaments.
 
 from __future__ import annotations
 
+import copy
 import glob
 import os
 import re
@@ -30,7 +31,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from helix_geom import fit_pose, roll_from_eulers, dominant_phase, polarity_dyad_angle
+from helix_geom import (fit_pose, roll_from_eulers, dominant_phase,
+                        polarity_dyad_angle, dynamo_rotation, oriented_axis)
 
 # A real tilt flip is a head<->tail dyad: the two polarity groups' mean z-axes are
 # ~antiparallel (angle near 180). Below this the split is spurious (z ~perp to the
@@ -68,12 +70,43 @@ class Filament:
     phi0: float = float("nan")  # model phase of the majority register (deg)
     phi0_flip: float = float("nan")  # phase of the flipped (minority-polarity) register (deg)
     axis: np.ndarray = None     # (3,) unit filament axis (fittable only); for iteration roll
+    axis_oriented: np.ndarray = None  # (3,) axis pinned to the majority pose direction
     traj_roll: np.ndarray = None  # (n_iter, N) roll per Dynamo iteration, ordered like tags; or None
     traj_iters: list = None     # iteration numbers matching traj_roll rows; or None
+    traj_eulers: np.ndarray = None  # (n_iter, N, 3) pose per iteration, ordered like tags; or None
 
     @property
     def n(self) -> int:
         return len(self.tags)
+
+    def at_iteration(self, k: int, rate: float, pixelsize: float) -> "Filament":
+        """A view of this filament with the poses it had at trajectory row `k`.
+
+        Coordinates never move between iterations (only the angles are refined), so
+        tags, xy/xyz, pos_px and the fitted axis are shared unchanged and just the
+        pose-derived arrays are recomputed -- which is what makes stepping through
+        iterations cheap. Returns a shallow copy, so the caller can hand it to any
+        plot/fit helper that takes a Filament; `self` is returned untouched when no
+        trajectory is attached.
+
+        Rows for a tag missing at that iteration are NaN (see _attach_trajectories);
+        NaN flows through scipy's Rotation without raising, so such segments simply
+        read as NaN roll / off-axis tilt rather than breaking the view.
+        """
+        if self.traj_eulers is None or not self.fittable:
+            return self
+        eul = np.asarray(self.traj_eulers[k], float)
+        f = copy.copy(self)
+        f.eulers = eul
+        f.phi = roll_from_eulers(eul, self.axis)
+        z = dynamo_rotation(eul).as_matrix()[:, :, 2]
+        pol = np.sign(z @ np.asarray(self.axis, float))
+        pol[pol == 0] = 1.0
+        f.polarity = pol
+        # axis_oriented stays the FINAL-pose orientation (copied): the dark/amber
+        # split must mean the same thing at every iteration to be comparable.
+        f.apply_model(rate, pixelsize)
+        return f
 
     def apply_model(self, rate: float, pixelsize: float) -> None:
         """Refresh the model-dependent arrays for a new rate / pixel-size.
@@ -134,6 +167,20 @@ class Dataset:
             f.apply_model(self.model_rate, self.pixelsize)
 
     @property
+    def iter_labels(self) -> list:
+        """Iteration numbers of the attached trajectory rows (oldest->newest), or []
+        when the dataset was loaded without --iteration-paths. The LAST row is the
+        working set (what every non-iteration view shows)."""
+        for f in self.filaments:
+            if f.traj_iters:
+                return list(f.traj_iters)
+        return []
+
+    @property
+    def n_iterations(self) -> int:
+        return len(self.iter_labels)
+
+    @property
     def pos_halfspan(self) -> float:
         """Largest |pos| (Angstrom) across fittable filaments -> shared x-scale."""
         h = 0.0
@@ -159,7 +206,8 @@ def _build_filament(fid, tags, xyz, eulers) -> Filament:
     # where it can lean on the robust main-register fit; here we just carry polarity.
     return Filament(fid=int(fid), tags=tags[o], pos_px=fp["pos"], phi=fp["phi"],
                     xy=xyz[o, :2], xyz=xyz[o], eulers=eulers[o], fittable=True,
-                    axis=fp["axis"], polarity=fp["polarity"])
+                    axis=fp["axis"], polarity=fp["polarity"],
+                    axis_oriented=oriented_axis(eulers[o], fp["axis"]))
 
 
 # --- Dynamo --------------------------------------------------------------------
@@ -237,10 +285,40 @@ def _euler_map(tables, tomo_id) -> dict:
     return dict(zip(tags.tolist(), par[:, COL_EULER].astype(float)))
 
 
+def _fill_trajectories(filaments, labels, maps) -> None:
+    """Attach the per-iteration poses (traj_eulers) and rolls (traj_roll) to every
+    fittable filament. Shared by the Dynamo and RELION paths, which differ only in
+    how they build `maps` -- one {tag: euler triple} per iteration, oldest->newest.
+
+    Rolls are measured about the FIXED final axis: the picking coordinates are
+    identical across iterations, so the axis never moves and the trail is pure roll
+    convergence. Segments missing from an iteration stay NaN in both arrays.
+    """
+    nan3 = np.full(3, np.nan)
+    for fil in filaments:
+        if not fil.fittable:
+            continue
+        eulers = np.full((len(maps), fil.n, 3), np.nan)
+        traj = np.full((len(maps), fil.n), np.nan)
+        for ii, emap in enumerate(maps):
+            eul = np.array([emap.get(int(t), nan3) for t in fil.tags])   # (N, 3)
+            eulers[ii] = eul
+            valid = np.isfinite(eul[:, 0])
+            if valid.any():
+                traj[ii, valid] = roll_from_eulers(eul[valid], fil.axis)
+        # The last row IS the working set every other view shows, so pin it to the
+        # loaded poses rather than to the last iteration file -- the two can differ
+        # (RELION reads run_data.star, whose row is labelled with the last run_it).
+        eulers[-1] = fil.eulers
+        traj[-1] = fil.phi
+        fil.traj_eulers = eulers
+        fil.traj_roll = traj
+        fil.traj_iters = labels
+
+
 def _attach_trajectories(filaments, folders, tomo_id) -> None:
-    """For each fittable filament, fill traj_roll: the per-segment roll measured at
-    iteration 0 (the starting_values that seeded iteration 1) and every iteration,
-    about the (fixed) final axis. Segments are matched by tag."""
+    """Dynamo: per-iteration poses from iteration 0 (the starting_values that seeded
+    iteration 1) and every refined iteration. Segments are matched by tag."""
     labels, maps = [], []
     # iteration 0: starting_values sit next to the FIRST iteration's averages
     start_dir = os.path.join(os.path.dirname(folders[0][1]), "starting_values")
@@ -253,20 +331,7 @@ def _attach_trajectories(filaments, folders, tomo_id) -> None:
     for it, d in folders:
         labels.append(it)
         maps.append(_euler_map(find_ref_tables(d), tomo_id))
-
-    nan3 = np.full(3, np.nan)
-    for fil in filaments:
-        if not fil.fittable:
-            continue
-        traj = np.full((len(maps), fil.n), np.nan)
-        for ii, emap in enumerate(maps):
-            eul = np.array([emap.get(int(t), nan3) for t in fil.tags])   # (N, 3)
-            valid = np.isfinite(eul[:, 0])
-            if valid.any():
-                traj[ii, valid] = roll_from_eulers(eul[valid], fil.axis)
-        traj[-1] = fil.phi                       # final row == the dot (path ends on it)
-        fil.traj_roll = traj
-        fil.traj_iters = labels
+    _fill_trajectories(filaments, labels, maps)
 
 
 def _build_dynamo(path: str, tomo, write_temp: bool, trails: bool = False):
@@ -306,29 +371,17 @@ def relion_to_dynamo_table(d: dict) -> np.ndarray:
 
 
 def _attach_relion_trajectories(filaments, iter_stars, tomo_name) -> None:
-    """RELION analogue of _attach_trajectories: per fittable filament, roll at every
-    refinement iteration (run_it000 = the start) about the fixed final axis, matched
-    by _rlnTomoParticleId. Each iteration star's pose is converted to Dynamo eulers
-    by load_particles, so the roll is computed identically to the final set."""
+    """RELION analogue of _attach_trajectories: poses at every refinement iteration
+    (run_it000 = the start), matched by _rlnTomoParticleId. Each iteration star is
+    read through load_particles, so its poses reach the Dynamo convention exactly
+    the way the final set does."""
     from relion_star import load_particles
     labels, maps = [], []
     for label, star in iter_stars:
         _, d = load_particles(star, tomo_name)
         labels.append(label)
         maps.append(dict(zip(d["pid"].astype(int).tolist(), d["eulers"])))
-    nan3 = np.full(3, np.nan)
-    for fil in filaments:
-        if not fil.fittable:
-            continue
-        traj = np.full((len(maps), fil.n), np.nan)
-        for ii, emap in enumerate(maps):
-            eul = np.array([emap.get(int(t), nan3) for t in fil.tags])   # (N, 3)
-            valid = np.isfinite(eul[:, 0])
-            if valid.any():
-                traj[ii, valid] = roll_from_eulers(eul[valid], fil.axis)
-        traj[-1] = fil.phi                       # final row == the dot (path ends on it)
-        fil.traj_roll = traj
-        fil.traj_iters = labels
+    _fill_trajectories(filaments, labels, maps)
 
 
 def _build_relion(path: str, tomo, write_temp: bool = True, trails: bool = False):
@@ -353,6 +406,45 @@ def _build_relion(path: str, tomo, write_temp: bool = True, trails: bool = False
     if trails and len(iters) > 1:                    # earlier iterations -> convergence trails
         _attach_relion_trajectories(filaments, iters, tomo_name)
     return tomo_name, d["n"], filaments
+
+
+# --- deferred trajectory loading ------------------------------------------------
+def _iteration_sources(ds):
+    """The per-iteration inputs `ds.source` holds, WITHOUT reading any of them.
+
+    Just a glob, so the GUI can ask "is there an iteration history here?" for free and
+    defer the (multi-second) read until the user actually asks for it.
+    """
+    try:
+        if ds.fmt == "relion":
+            from relion_star import iteration_stars
+            return iteration_stars(ds.source)
+        return find_iteration_folders(ds.source)
+    except (OSError, ValueError):
+        return []
+
+
+def can_attach_trajectories(ds) -> bool:
+    """True if `ds.source` offers more than one iteration to step through."""
+    return len(_iteration_sources(ds)) > 1
+
+
+def attach_trajectories(ds) -> int:
+    """Read every iteration of `ds.source` and attach the per-iteration poses/rolls.
+
+    Exactly what load_dataset(trails=True) does, factored out so it can be triggered
+    later from the GUI -- the read is far too slow to do on every startup, but making
+    it a launch-only flag hid the feature from anyone who did not know to pass it.
+    Returns the number of iterations attached (0 if there is no history).
+    """
+    srcs = _iteration_sources(ds)
+    if len(srcs) < 2:
+        return 0
+    if ds.fmt == "relion":
+        _attach_relion_trajectories(ds.filaments, srcs, ds.tomo)
+    else:
+        _attach_trajectories(ds.filaments, srcs, ds.tomo)
+    return ds.n_iterations
 
 
 # --- dispatch ------------------------------------------------------------------
