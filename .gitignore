@@ -13,4 +13,6 @@ test_data/
 *.mrc
 *.em
 *.map
-*.rec_diag/
+*.rec
+_diag/
+

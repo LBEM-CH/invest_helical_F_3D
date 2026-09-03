@@ -8,23 +8,7 @@ subtomogram-averaging project. It reconstructs the per-filament *helical roll ch
 lets you mark bad segments for removal. Built to run over `ssh -XY` and stay responsive
 (PyQt6 + pyqtgraph, raster renderer, no OpenGL).
 
-## The name
-
-**Roh·lex** = **ro**ll + **h**e**l**ix.
-
-| | from | |
-|---|---|---|
-| **Ro** | **ro**ll | the rotation of each subunit about the filament axis |
-| **h** | **h**elix | the axis it rotates about |
-| **lex** | he**lix** | |
-
-Those two words are the whole measurement. For every segment the tool reads its **roll** —
-how far it is turned about the filament axis — and its position along that axis, then checks
-whether the two advance together at the rate the **helix** demands. A subunit that follows
-the screw sits on a straight line; one that does not stands out and can be removed.
-
-So the name is not decoration: it is the pair of quantities on the two axes of every plot the
-software draws. See [`docs/README.md`](docs/README.md) for the full method.
+ See [`docs/README.md`](docs/README.md) for the full method.
 
 ## What it does
 
