@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RELION 5 (tomography) STAR reading for invest_helical_F_3D.
+RELION 5 (tomography) STAR reading for Rohlex.
 
 author: Wen-Lu Chung
 

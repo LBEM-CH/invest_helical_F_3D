@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Per-filament detail window for invest_helical_F_3D.
+Per-filament detail window for Rohlex.
 
 author: Wen-Lu Chung
 
@@ -23,12 +23,12 @@ import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
 
 from dynamo_table import Filament
-from helix_geom import (model_line, register_flip_rotation, flipped_eulers,
-                        rot_flip_eulers, axis_tilt)
+from helix_geom import polarity_flip_eulers, rot_flip_eulers, axis_tilt
 from plot_common import (HILITE_PEN, ModelParams, ParamBar, SelectableViewBox,
                          effective_phi, effective_tilt, pos_brushes, tilt_brushes,
                          tilt_off_axis, TILT_ZONE, PLAIN_BTN_QSS, color_button_qss,
                          category_visible_mask, tilt_counts, tilt_category,
+                         unwrap_roll, on_branch, unwrapped_phase,
                          CAT_DARK, CAT_BAD, CAT_AMBER)
 
 _DASH = pg.mkPen("k", width=1.6, style=QtCore.Qt.PenStyle.DashLine)
@@ -50,45 +50,41 @@ def _color_button(btn, rgb):
 _TRAJ_PEN = pg.mkPen((80, 80, 80, 160), width=1.6)   # grey iteration trails (thicker, antialiased)
 
 
-def _iter_path_xy(pos, traj_roll):
-    """Connect each segment's per-iteration rolls, keeping every value in (-180,180]
-    (the real roll domain -- no >180 numbers). A step that crosses the +/-180 seam is
-    drawn as two pieces: up to the edge, then in from the opposite edge (a NaN break
-    between), so the trail "wraps" instead of running off-scale, and no dot is left
-    unlinked. A NaN also separates segments, for one connect='finite' item.
+def _iter_path_xy(pos, traj_roll, u_final):
+    """Connect each segment's per-iteration rolls, in the UNWRAPPED frame.
+
+    Every iteration's roll is placed on the turn nearest that segment's FINAL
+    unwrapped value (u_final), so the trail ends exactly on its coloured dot and can
+    never wander more than half a turn from it. The old +/-180 seam-splitting is gone
+    with the wrapping that required it. A NaN separates segments, for one
+    connect='finite' item.
     """
     n_iter, N = traj_roll.shape
     xs, ys = [], []
     for j in range(N):
         x = float(pos[j])
-        prev = None
+        ref = u_final[j]
         for i in range(n_iter):
             r = traj_roll[i, j]
-            if not np.isfinite(r):
-                prev = None
+            if not np.isfinite(r) or not np.isfinite(ref):
                 continue
-            if prev is not None:
-                step = ((r - prev + 180.0) % 360.0) - 180.0    # short signed move
-                if prev + step > 180.0:                        # crossed the top seam
-                    xs += [x, np.nan, x]; ys += [180.0, np.nan, -180.0]
-                elif prev + step < -180.0:                     # crossed the bottom seam
-                    xs += [x, np.nan, x]; ys += [-180.0, np.nan, 180.0]
-            xs.append(x); ys.append(float(r))
-            prev = r
+            xs.append(x); ys.append(float(r + 360.0 * round((ref - r) / 360.0)))
         xs.append(np.nan); ys.append(np.nan)                   # separate segments
     return np.asarray(xs), np.asarray(ys)
 
 
-def _iter_start_xy(pos, traj_roll):
+def _iter_start_xy(pos, traj_roll, u_final):
     """Positions for the starting-value markers: row 0 (iteration 0, the start that
     seeded iteration 1). Intermediate iterations get NO marker -- only the line --
-    and the final iteration is the colored data dot. Returns (xs, ys)."""
+    and the final iteration is the colored data dot. Placed in the same unwrapped
+    frame as the trail. Returns (xs, ys)."""
     start = traj_roll[0]
     xs, ys = [], []
     for j in range(len(start)):
-        r = start[j]
-        if np.isfinite(r):
-            xs.append(float(pos[j])); ys.append(float(r))
+        r, ref = start[j], u_final[j]
+        if np.isfinite(r) and np.isfinite(ref):
+            xs.append(float(pos[j]))
+            ys.append(float(r + 360.0 * round((ref - r) / 360.0)))
     return xs, ys
 
 
@@ -274,7 +270,7 @@ class DetailWindow(QtWidgets.QMainWindow):
         glw = pg.GraphicsLayoutWidget()
         outer.addWidget(glw, 1)
         self.p1 = _Panel(glw, 0, 0, f"fil {fil.fid}: roll vs position",
-                         "position along axis (Å)", "roll (deg)")
+                         "position along axis (Å)", "unwrapped roll (deg)")
         self.p2 = _Panel(glw, 0, 1, "residual to model",
                          "position along axis (Å)", "delta: data - model (deg)")
         self.p3 = _Panel(glw, 0, 2, "XY map", "X (px)", "Y (px)")
@@ -288,8 +284,9 @@ class DetailWindow(QtWidgets.QMainWindow):
         self.traj_item = pg.PlotDataItem([], [], connect="finite", pen=_TRAJ_PEN,
                                          antialias=True)
         self.traj_item.setZValue(-10)                  # beneath the dots and model line
-        # ignoreBounds: trails must not drive auto-range -- the view stays on the
-        # roll domain (~[-180,180]); genuinely big-wandering trails just run off it.
+        # ignoreBounds: trails must not drive auto-range -- the view stays on the span
+        # of the unwrapped roll. Each trail is placed within half a turn of its own
+        # dot (_iter_path_xy), so it is in view anyway.
         self.p1.plot.addItem(self.traj_item, ignoreBounds=True)
         # grey marker at the starting values (iteration 0); the final iter is the
         # colored dot, and intermediate iters are line-only.
@@ -319,7 +316,6 @@ class DetailWindow(QtWidgets.QMainWindow):
         # --- flip state ------------------------------------------------------
         self.mode = "exclude"                          # or "flip"
         self.flip_staged: set[int] = set()             # staged for flip, not yet committed
-        self._S = False                                # lazy register-flip rotation cache
 
         # --- wiring ----------------------------------------------------------
         for p in self.panels:
@@ -353,14 +349,11 @@ class DetailWindow(QtWidgets.QMainWindow):
     def _refit(self):
         """Parameters changed (or first show): redraw the rate-dependent overlays
         (model line, flipped-register line, iteration trails), then refresh data."""
-        self._S = False                                # rate changed -> recompute flip op
         if self.fil.fittable and np.isfinite(self.fil.phi0):
-            xx, model = model_line(self.params.ds.pos_halfspan, self.fil.phi0,
-                                   self.params.model_rate)
-            self.model_item.setData(xx, model)
-            xr, rot = model_line(self.params.ds.pos_halfspan, self.fil.phi0 + 180.0,
-                                 self.params.model_rate)
-            self.model_rot_item.setData(xr, rot)       # dark-blue rot-flip register (+180)
+            xx, phi0 = self._model_xx(), self._model_phase()
+            self.model_item.setData(xx, self.params.model_rate * xx + phi0)
+            self.model_rot_item.setData(                # dark-blue rot-flip register (+180)
+                xx, self.params.model_rate * xx + phi0 + 180.0)
         else:
             self.model_item.setData([], [])
             self.model_rot_item.setData([], [])
@@ -368,9 +361,10 @@ class DetailWindow(QtWidgets.QMainWindow):
         # per-iteration roll-convergence trails (uses current Angstrom x). These are
         # the ORIGINAL rolls and are never altered by a flip.
         if self.fil.traj_roll is not None and self.chk_traj.isChecked():
-            xs, ys = _iter_path_xy(self.fil.pos, self.fil.traj_roll)   # true rolls, seam-aware
+            u = self._unwrapped()
+            xs, ys = _iter_path_xy(self.fil.pos, self.fil.traj_roll, u)
             self.traj_item.setData(xs, ys)
-            nx, ny = _iter_start_xy(self.fil.pos, self.fil.traj_roll)
+            nx, ny = _iter_start_xy(self.fil.pos, self.fil.traj_roll, u)
             if nx:
                 self.traj_nodes.setData(x=nx, y=ny)
             else:
@@ -380,17 +374,39 @@ class DetailWindow(QtWidgets.QMainWindow):
             self.traj_nodes.setData([])
         self._refresh_data()
 
+    # --- unwrapped-roll frame -------------------------------------------------
+    # The roll panel plots the roll UNWRAPPED (plot_common.unwrap_roll) so a fast
+    # screw stays readable; every register line is therefore one straight line and
+    # every marker has to be placed on the same turn as the data it belongs to.
+    def _unwrapped(self):
+        """The filament's raw roll, unwrapped head-to-tail. Model-free and stable:
+        it does not move when twist / rise / pixel size are retuned."""
+        return unwrap_roll(self.fil.phi)
+
+    def _model_xx(self):
+        h = self.params.ds.pos_halfspan
+        return np.array([-h, h])
+
+    def _model_phase(self, phi0=None):
+        """A register's phase lifted by whole turns onto the unwrapped data, so its
+        straight line is drawn where the points are. The model is unchanged modulo
+        360, so the residual panel and the tilt colours are untouched."""
+        if phi0 is None:
+            phi0 = self.fil.phi0
+        return unwrapped_phase(self._unwrapped(), self.fil.pos,
+                               self.params.model_rate, phi0)
+
     def _refit_flip(self):
         """Draw the polarity-flipped register as a pink dashed line and note it in
         the title (no rings -- those appear only as post-flip ghosts)."""
         fil = self.fil
         if fil.fittable and np.isfinite(fil.phi0_flip):
-            xx, model = model_line(self.params.ds.pos_halfspan, fil.phi0_flip,
-                                   self.params.model_rate)
-            self.model_flip_item.setData(xx, model)
-            xb, modelb = model_line(self.params.ds.pos_halfspan, fil.phi0_flip + 180.0,
-                                    self.params.model_rate)
-            self.model_both_item.setData(xb, modelb)   # tilt + rot register (pink + 180)
+            xx = self._model_xx()
+            phi0f = self._model_phase(fil.phi0_flip)
+            rate = self.params.model_rate
+            self.model_flip_item.setData(xx, rate * xx + phi0f)
+            # tilt + rot register (pink + 180)
+            self.model_both_item.setData(xx, rate * xx + phi0f + 180.0)
             doff = ((fil.phi0_flip - fil.phi0 + 180) % 360) - 180
             self.p1.plot.setTitle(
                 f"fil {fil.fid}: roll vs position   "
@@ -402,21 +418,14 @@ class DetailWindow(QtWidgets.QMainWindow):
             self.p1.plot.setTitle(f"fil {fil.fid}: roll vs position")
 
     # --- flip machinery -------------------------------------------------------
-    def _flip_rotation(self):
-        """Lazily compute (and cache) S: the rotation mapping this filament's flipped
-        register onto the majority one. None if both polarities aren't present."""
-        if self._S is False:
-            fil = self.fil
-            ok = (fil.fittable and getattr(fil, "flipped", np.array([])).size == fil.n
-                  and fil.flipped.any() and (~fil.flipped).any())
-            self._S = (register_flip_rotation(fil.eulers, fil.pos, fil.axis, fil.flipped,
-                                              self.params.model_rate, fil.phi0, fil.phi0_flip)
-                       if ok else None)
-        return self._S
-
     def _effective_arrays(self):
         """(roll, residual) with committed flips applied -- flipped tags read their
-        NEW roll (from the stored flipped angles); everything else is the original."""
+        NEW roll (from the stored flipped angles); everything else is the original.
+
+        The roll comes back in the UNWRAPPED frame for the panel; the residual is
+        computed from the wrapped roll exactly as before, so marking, the tilt colours
+        and the auto-exclude threshold are unaffected by the display change.
+        """
         fil = self.fil
         phi = effective_phi(fil, self.store)
         if fil.fittable and np.isfinite(fil.phi0):
@@ -424,7 +433,7 @@ class DetailWindow(QtWidgets.QMainWindow):
             delta = ((phi - model + 180) % 360) - 180
         else:
             delta = np.full(fil.n, np.nan)
-        return phi, delta
+        return on_branch(phi, self._unwrapped()), delta
 
     def _refresh_data(self):
         """Push effective roll/residual into the panels and redraw flip markers."""
@@ -438,12 +447,13 @@ class DetailWindow(QtWidgets.QMainWindow):
         """Ghost rings at the OLD roll of committed flips; squares stay on every
         flipped (committed) OR staged segment so you can see what is/was flipped."""
         fil = self.fil
+        u = self._unwrapped()          # ghosts sit at the OLD roll, in the panel's frame
         gx, gy, sx, sy = [], [], [], []
         for i, t in enumerate(fil.tags):
             t = int(t)
             flipped = self.store.is_flipped(t)
             if flipped:
-                gx.append(float(fil.pos[i])); gy.append(float(fil.phi[i]))
+                gx.append(float(fil.pos[i])); gy.append(float(u[i]))
             if flipped or t in self.flip_staged:
                 sx.append(float(fil.pos[i])); sy.append(float(phi_eff[i]))
         self.ghost_marker.setData(x=gx, y=gy)
@@ -472,20 +482,17 @@ class DetailWindow(QtWidgets.QMainWindow):
         if not self.flip_staged:
             return
         fil = self.fil
-        S = self._flip_rotation()
-        if which == "tilt" and S is None:
-            QtWidgets.QMessageBox.information(
-                self, "tilt-flip", "No flipped register detected in this filament — "
-                "both polarities must be present to define the tilt flip.")
-            return
         idx = np.array([i for i, t in enumerate(fil.tags)
                         if int(t) in self.flip_staged], int)
         orig = fil.eulers[idx]
-        rate = self.params.model_rate
-        pose = {(0, 0): orig, (0, 1): rot_flip_eulers(orig, fil.axis)}
-        if S is not None:
-            tilt = flipped_eulers(orig, fil.pos[idx], fil.axis, rate, S, np.ones(len(idx), bool))
-            pose[(1, 0)] = tilt
+        # Identical operation to "tilt-flip all": reverse each staged segment where it
+        # stands, no fit and no rate involved (helix_geom.polarity_flip_eulers). It is
+        # always available -- unlike the old register flip it needs neither a second
+        # polarity group in this filament nor a fittable axis.
+        tilt = polarity_flip_eulers(orig)
+        pose = {(0, 0): orig, (1, 0): tilt}
+        if fil.fittable and fil.axis is not None:          # rot needs the filament axis
+            pose[(0, 1)] = rot_flip_eulers(orig, fil.axis)
             pose[(1, 1)] = rot_flip_eulers(tilt, fil.axis)
         set_map, clear = {}, []
         for k, i in enumerate(idx):
@@ -497,7 +504,7 @@ class DetailWindow(QtWidgets.QMainWindow):
                 rt ^= 1
             if (tt, rt) == (0, 0):
                 clear.append(t)
-            elif (tt, rt) in pose:                     # tilt states need S; skip if absent
+            elif (tt, rt) in pose:                     # rot states need an axis; skip if absent
                 set_map[t] = (tt, rt, tuple(pose[(tt, rt)][k]))
         self.flip_staged.clear()                       # commit frees the selection (point 3/4)
         self.store.replace_flips(set_map, clear)       # one save+signal -> refresh redraws markers

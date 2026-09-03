@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared pyqtgraph helpers for invest_helical_F_3D.
+Shared pyqtgraph helpers for Rohlex.
 
 author: Wen-Lu Chung
 """
@@ -68,6 +68,20 @@ def _oriented_axis(fil) -> np.ndarray:
     return oriented_axis(fil.eulers, fil.axis)
 
 
+def effective_eulers(fil, store, use_flips: bool = True) -> np.ndarray:
+    """(N, 3) raw Dynamo angles with committed flips applied -- a flipped tag reads its
+    stored (flipped) triple, everything else its original. The pose-level counterpart of
+    effective_phi/effective_tilt, for views that need the whole orientation rather than
+    one derived angle (the 3D pointing arrows, the export path)."""
+    eul = np.asarray(fil.eulers, float).copy()
+    if not use_flips:
+        return eul
+    idx, ang = _flip_overrides(fil, store)
+    if idx is not None:
+        eul[idx] = ang
+    return eul
+
+
 def effective_tilt(fil, store, use_flips: bool = True) -> np.ndarray:
     """Tilt-to-axis angle per segment (deg, [0,180]) with committed flips applied: a
     flipped tag reads the tilt of its stored (flipped) pose. Measured against the fixed
@@ -81,6 +95,73 @@ def effective_tilt(fil, store, use_flips: bool = True) -> np.ndarray:
     if idx is not None:
         tilt[idx] = axis_tilt(ang, n, orient=False)
     return tilt
+
+
+# --- unwrapped roll -------------------------------------------------------------
+# The roll panels plot the roll UNWRAPPED head-to-tail instead of wrapped into
+# (-180, 180]. Wrapping is what made a fast screw unreadable: at twist 166 / rise 27
+# the model turns once every 58.6 A, and an overview panel spanning 1237 A in 190 px
+# gives 9 px per turn -- the dashed model came out as ~21 near-vertical strokes and
+# nothing could be judged against it. Unwrapped, the same filament is one straight
+# climb of ~3500 deg and the model is a single straight line at any twist.
+#
+# unwrap_roll() is MODEL-FREE on purpose: it consults the roll only, never twist,
+# rise or pixel size. So the points do not move when those are retuned -- only the
+# model line does. An unwrap that snapped each point to the nearest branch OF THE
+# MODEL was tried and rejected: it draws a perfect straight line for ANY twist you
+# type (verified on the amyloid set, a deliberately wrong 166/26 model scored 105 deg
+# against 98 for the correct one), so it can never show that the model is wrong.
+#
+# Known limitation: a step to the branch nearest zero loses a whole turn whenever the
+# alignment advances two subunits between neighbouring picks (the true +332 reads as
+# -28). On the actin set that pulls the apparent twist from 166 down to ~110 on the
+# filaments with plateaus. The picture stays honest -- it is the alignment's own
+# jumps that are being drawn -- but do not read a precise twist off the slope.
+
+def unwrap_roll(phi: np.ndarray) -> np.ndarray:
+    """Roll unwrapped head-to-tail: each step taken to the branch nearest zero.
+
+    Model-free (see the note above). NaN entries -- segments missing at an earlier
+    iteration -- keep their NaN and are bridged, so a gap does not desynchronise
+    everything after it.
+    """
+    phi = np.asarray(phi, float)
+    out = np.full(phi.shape, np.nan)
+    ok = np.isfinite(phi)
+    if not ok.any():
+        return out
+    p = phi[ok]
+    out[ok] = p[0] + np.r_[0.0, np.cumsum(((np.diff(p) + 180.0) % 360.0) - 180.0)]
+    return out
+
+
+def on_branch(y: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """`y` moved by whole turns onto the turn nearest `ref`, elementwise.
+
+    Lets a derived roll -- a flip's new angle, an earlier iteration's pose, the ghost
+    of an old one -- be drawn in the same unwrapped frame as the main curve without
+    re-unwrapping it (which would let one changed segment shift everything after it).
+    """
+    y = np.asarray(y, float)
+    ref = np.asarray(ref, float)
+    shift = np.where(np.isfinite(ref) & np.isfinite(y),
+                     360.0 * np.round((ref - y) / 360.0), 0.0)
+    return y + shift
+
+
+def unwrapped_phase(u: np.ndarray, pos: np.ndarray, rate: float, phi0: float) -> float:
+    """`phi0` lifted by whole turns so the straight model line sits on the unwrapped
+    data. Changes the model by a multiple of 360 only, so the residual, the tilt
+    colours and the auto-exclude are untouched -- this moves the drawn line, nothing
+    else. Returns phi0 unchanged when there is nothing to anchor to.
+    """
+    u = np.asarray(u, float)
+    ok = np.isfinite(u)
+    if not np.isfinite(phi0) or not ok.any():
+        return phi0
+    off = np.median(u[ok] - rate * np.asarray(pos, float)[ok] - phi0)
+    return float(phi0 + 360.0 * np.round(off / 360.0))
+
 
 # A viridis-like colormap defined explicitly so we don't depend on matplotlib
 # (pyqtgraph's get('viridis') needs matplotlib/colorcet installed).

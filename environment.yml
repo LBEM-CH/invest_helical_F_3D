@@ -1,17 +1,17 @@
-# Cross-platform conda environment for invest_helical_F_3D.
+# Cross-platform conda environment for Rohlex.
 #
 # conda-forge ships only PyQt5, so the Qt / GUI stack is installed via pip (PyPI
 # has PyQt6 wheels for Linux and macOS, incl. Apple Silicon). conda just manages
 # the Python interpreter + numpy/scipy here.
 #
 #   conda env create -f environment.yml
-#   conda activate invest_helical
+#   conda activate rohlex
 #
 # Linux on a no-sudo cluster: also run
 #   conda install -c conda-forge xcb-util-cursor
 # so PyQt6's xcb plugin finds libxcb-cursor.so.0 (not needed on macOS/Windows).
 #
-name: invest_helical
+name: rohlex
 channels:
   - conda-forge
 dependencies:

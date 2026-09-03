@@ -4,7 +4,7 @@ relion2dynamo — convert RELION 5 (tomography) particle poses to a Dynamo .tbl.
 
 author: Wen-Lu Chung
 
-Reuses the exact relion -> dynamo pose conversion that invest_helical_F_3D uses
+Reuses the exact relion -> dynamo pose conversion that Rohlex uses
 (relion_star.relion_to_dynamo_eulers), so a table written here is identical to
 the app's temp.tbl. The Dynamo angles land in columns 7-9; from there the
 standard Dynamo -> ChimeraX placement is:

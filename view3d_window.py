@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-In-app 3D view for invest_helical_F_3D.
+In-app 3D view for Rohlex.
 
 author: Wen-Lu Chung
 
@@ -28,8 +28,8 @@ import pyqtgraph.opengl as gl
 from PyQt6 import QtCore, QtWidgets
 from scipy.spatial.transform import Rotation as Rot
 
-from plot_common import viridis_rgba
-from helix_geom import dynamo_rotation
+from plot_common import viridis_rgba, effective_eulers, _oriented_axis
+from helix_geom import dynamo_rotation, TILT_CONE
 
 _HORIZONTAL = QtCore.Qt.Orientation.Horizontal
 
@@ -66,6 +66,37 @@ def pose_triads(xyz: np.ndarray, eulers: np.ndarray, length: float,
     pts[:, :, 1, :] = xyz[:, None, :] + length * axes       # end = center + L*axis
     cols = np.broadcast_to(_AXIS_RGBA[None, :, None, :], (len(xyz), 3, 2, 4))
     return pts.reshape(-1, 3), cols.reshape(-1, 4)
+
+
+# Pointing-arrow colors, matching the 2D tilt dots: dark = along the tube axis,
+# amber = backwards, grey = sideways (neither -- the flip cannot fix these).
+_ALONG_RGBA = np.array([0.16, 0.17, 0.23, 1.0])
+_BACK_RGBA = np.array([0.94, 0.66, 0.0, 1.0])
+_SIDE_RGBA = np.array([0.62, 0.62, 0.62, 1.0])
+
+
+def pointing_arrows(xyz: np.ndarray, eulers: np.ndarray, axis: np.ndarray,
+                    length: float, invert: bool = False):
+    """One line per segment along its POINTING direction (the pose z axis), colored by
+    how that direction sits against the tube axis: along / backwards / sideways.
+
+    This is the direct read-out of what a polarity flip does -- the flip exactly negates
+    the pose z axis, so every backwards (amber) arrow becomes an along (dark) one and the
+    sideways (grey) ones are untouched. Returns (pts, colors, counts) with pts (2N, 3) and
+    colors (2N, 4) for GLLinePlotItem(mode="lines"); counts is (along, backwards, sideways).
+    """
+    xyz = np.asarray(xyz, float)
+    z = _rotations(eulers, invert).as_matrix()[:, :, 2]          # (N, 3) pointing dirs
+    ang = np.degrees(np.arccos(np.clip(z @ np.asarray(axis, float), -1.0, 1.0)))
+    along, back = ang <= TILT_CONE, ang >= 180.0 - TILT_CONE
+    cols = np.broadcast_to(_SIDE_RGBA, (len(xyz), 4)).copy()
+    cols[along] = _ALONG_RGBA
+    cols[back] = _BACK_RGBA
+    pts = np.empty((len(xyz), 2, 3))
+    pts[:, 0, :] = xyz                                           # tail at the segment
+    pts[:, 1, :] = xyz + length * z                              # head along the pose z
+    return (pts.reshape(-1, 3), np.repeat(cols, 2, axis=0),
+            (int(along.sum()), int(back.sum()), int(len(xyz) - along.sum() - back.sum())))
 
 
 def isosurface(volume: np.ndarray, level: float):
@@ -153,6 +184,9 @@ class View3DWindow(QtWidgets.QMainWindow):
                                                 width=1.0, antialias=True))
         self.glyphs = gl.GLLinePlotItem(mode="lines", width=2.0, antialias=True)
         self.view.addItem(self.glyphs)
+        # pointing arrows (thicker than the triads so they read as the primary cue)
+        self.arrows = gl.GLLinePlotItem(mode="lines", width=3.0, antialias=True)
+        self.view.addItem(self.arrows)
         # placed reference density: built-in 'shaded' lighting, medium blue-grey.
         self.mesh = gl.GLMeshItem(smooth=True, shader="shaded",
                                   color=_MESH_RGBA, glOptions="opaque")
@@ -163,7 +197,9 @@ class View3DWindow(QtWidgets.QMainWindow):
         self.view.addItem(self.hover)
 
         self._center_camera()
+        # a flip committed in any window changes the poses -> arrows/counts must follow
         self.store.changed.connect(self._recolor)
+        self.store.changed.connect(self._refresh)
         self._recolor()
         self._refresh()
 
@@ -182,6 +218,27 @@ class View3DWindow(QtWidgets.QMainWindow):
         self.chk_pose.setChecked(True)
         self.chk_pose.toggled.connect(self._refresh)
         v.addWidget(self.chk_pose)
+
+        # --- polarity check ---------------------------------------------------
+        self.chk_arrows = QtWidgets.QCheckBox("Show pointing direction")
+        self.chk_arrows.setToolTip(
+            "one arrow per segment along its pose z axis, coloured dark (along the tube), "
+            "amber (backwards) or grey (sideways). A tube whose polarity is sorted shows "
+            "one colour.")
+        self.chk_arrows.setChecked(True)
+        self.chk_arrows.toggled.connect(self._refresh)
+        v.addWidget(self.chk_arrows)
+
+        self.chk_preflip = QtWidgets.QCheckBox("…before committed flips")
+        self.chk_preflip.setToolTip(
+            "show the ORIGINAL poses instead of the flipped ones — toggle it to see what "
+            "the tilt-flip changed")
+        self.chk_preflip.toggled.connect(self._refresh)
+        v.addWidget(self.chk_preflip)
+
+        self.lbl_point = QtWidgets.QLabel("")
+        self.lbl_point.setWordWrap(True)
+        v.addWidget(self.lbl_point)
 
         v.addWidget(QtWidgets.QLabel("triad length (px)"))
         self.sl_len = QtWidgets.QSlider(_HORIZONTAL)
@@ -327,12 +384,28 @@ class View3DWindow(QtWidgets.QMainWindow):
 
     def _refresh(self):
         f = self.fil
+        # The arrows read the EFFECTIVE poses (committed flips applied) so the 3D view
+        # agrees with the 2D dots; the checkbox shows the originals for comparison.
+        eul = effective_eulers(f, self.store, not self.chk_preflip.isChecked())
         if self.chk_pose.isChecked() and f.n:
-            pts, cols = pose_triads(f.xyz, f.eulers, float(self.sl_len.value()),
+            pts, cols = pose_triads(f.xyz, eul, float(self.sl_len.value()),
                                     self._invert())
             self.glyphs.setData(pos=pts, color=cols)
         else:
             self.glyphs.setData(pos=np.zeros((0, 3)))
+        if self.chk_arrows.isChecked() and f.n and f.axis is not None:
+            pts, cols, (na, nb, ns) = pointing_arrows(
+                f.xyz, eul, _oriented_axis(f), float(self.sl_len.value()) * 1.6,
+                self._invert())
+            self.arrows.setData(pos=pts, color=cols)
+            when = "before flips" if self.chk_preflip.isChecked() else "as flipped"
+            self.lbl_point.setText(
+                f"<b>pointing ({when})</b><br>along axis {na} &nbsp; backwards {nb}"
+                f" &nbsp; sideways {ns}"
+                + ("<br><i>one direction throughout</i>" if nb == 0 and f.n else ""))
+        else:
+            self.arrows.setData(pos=np.zeros((0, 3)))
+            self.lbl_point.setText("")
         info = f"{f.n} particles"
         if self.chk_density.isChecked() and self.volume is not None and f.n:
             if self._iso is None:
@@ -340,8 +413,8 @@ class View3DWindow(QtWidgets.QMainWindow):
                 self._iso = isosurface(self.volume, lvl)
             verts, faces = self._iso
             stride = _face_budget(f.n, len(faces))
-            xyz, eul = f.xyz[::stride], f.eulers[::stride]
-            mv, mf = place_meshes(verts, faces, xyz, eul, self.scale, self._invert())
+            xyz, eul_s = f.xyz[::stride], eul[::stride]
+            mv, mf = place_meshes(verts, faces, xyz, eul_s, self.scale, self._invert())
             self.mesh.setMeshData(vertexes=mv, faces=mf)
             self.mesh.setVisible(True)
             info += (f"  |  density: {len(xyz)} copies (stride {stride}), {len(mf):,} faces"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Global twist auto-fit for invest_helical_F_3D.
+Global twist auto-fit for Rohlex.
 
 author: Wen-Lu Chung
 

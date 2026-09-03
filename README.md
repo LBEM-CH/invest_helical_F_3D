@@ -1,4 +1,6 @@
-# invest_helical_F_3D
+# Rohlex
+
+*Roll your helix.*
 
 Interactive triage of helical-filament segments from a Dynamo **or** RELION 5
 subtomogram-averaging project. It reconstructs the per-filament *helical roll check*
@@ -6,13 +8,32 @@ subtomogram-averaging project. It reconstructs the per-filament *helical roll ch
 lets you mark bad segments for removal. Built to run over `ssh -XY` and stay responsive
 (PyQt6 + pyqtgraph, raster renderer, no OpenGL).
 
+## The name
+
+**Roh·lex** = **ro**ll + **h**e**l**ix.
+
+| | from | |
+|---|---|---|
+| **Ro** | **ro**ll | the rotation of each subunit about the filament axis |
+| **h** | **h**elix | the axis it rotates about |
+| **lex** | he**lix** | |
+
+Those two words are the whole measurement. For every segment the tool reads its **roll** —
+how far it is turned about the filament axis — and its position along that axis, then checks
+whether the two advance together at the rate the **helix** demands. A subunit that follows
+the screw sits on a straight line; one that does not stands out and can be removed.
+
+So the name is not decoration: it is the pair of quantities on the two axes of every plot the
+software draws. See [`docs/README.md`](docs/README.md) for the full method.
+
 ## What it does
 
 For one tomogram it loads either input — the two `refined_table_ref_00X_iteYYYY.tbl` tables
 from a Dynamo `averages` folder, or a RELION 5 tomography particles `.star` — and for each
 filament:
 
-- fits the axis through the 3D coordinates (centroid = middle, SVD = head↔tail direction),
+- fits the axis through the 3D coordinates (origin = centroid, the *mean* of all segments,
+  not the middle one; direction = least-squares fit through every segment),
 - projects each segment onto the axis → **real position** (Å, via the pixel size),
 - reads the subunit **roll** about the axis,
 - compares to the screw model `roll = (twist/rise)·pos + phase`.
@@ -52,10 +73,10 @@ model line — that's what you mark.
   trail per segment showing how its roll moved from the **starting value** (grey dot,
   iteration 0 — Dynamo `ite_0001/starting_values/`, RELION `run_it000_data.star`) through each
   refinement iteration to the **final pose** (the colored dot). Intermediate iterations are
-  line-only. Rolls stay within ±180° — a step
-  crossing the ±180 seam wraps around the edge rather than streaking. A segment whose trail
-  wanders never settled. Toggle it off in the toolbar; solid line (vs the dashed model),
-  beneath the dots.
+  line-only. The trail is drawn in the same **unwrapped** frame as the panel: each iteration's
+  roll is placed on the turn nearest that segment's final value, so a trail always ends on its
+  own dot and never wanders more than half a turn from it. A segment whose trail wanders never
+  settled. Toggle it off in the toolbar; solid line (vs the dashed model), beneath the dots.
 
 ### Iteration slider (overview)
 An **iteration slider** under the toolbar scrubs *every* panel back through the refinement.
@@ -73,7 +94,7 @@ This is the intended way to see a measured twist decay across refinement. Two di
 causes produce that decay, and the job's `note.txt` tells you which one you have:
 
 - **Symmetry applied** (`--helix` *without* `--ignore_helical_symmetry`) — the case in
-  *Scope and known limitations* (`docs/pose_and_roll.md` §8): rot is defined only modulo
+  *Where the method does not apply* (`docs/README.md` §13): rot is defined only modulo
   the screw operator, so the accumulated phase is folded and the slope is attenuated.
 - **Symmetry ignored, rot unrestrained** (`--ignore_helical_symmetry` with `--sigma_rot 0`)
   — nothing ties consecutive segments' rot to their position, so the screw present in the
@@ -145,7 +166,7 @@ on every route — including inside the conda env.
 ### Simplest: pip (macOS, Windows, Linux-with-libs)
 
 ```bash
-cd invest_helical_F_3D
+cd rohlex
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt          # PyQt6 + pyqtgraph + scipy/numpy + eulerangles + PyOpenGL + mrcfile
@@ -161,9 +182,9 @@ On a shared Linux cluster where you can't `sudo apt install`, let conda supply t
 system libraries (the Qt binding still comes via pip per `environment.yml`):
 
 ```bash
-cd ~/LBEM/invest_helical_F_3D
+cd ~/LBEM/rohlex
 conda env create -f environment.yml             # python + numpy/scipy (conda), Qt stack (pip)
-conda activate invest_helical
+conda activate rohlex
 conda install -c conda-forge xcb-util-cursor    # provides libxcb-cursor.so.0 (Linux only)
 ```
 
@@ -187,16 +208,16 @@ The GUI needs a display, so connect with X11 forwarding first:
 
 ```bash
 ssh -XY user@cluster
-conda activate invest_helical          # or: source .venv/bin/activate
-cd ~/LBEM/invest_helical_F_3D
+conda activate rohlex          # or: source .venv/bin/activate
+cd ~/LBEM/rohlex
 
 # Dynamo project folder (auto-finds results/ite_*/averages, shows iteration paths)
-python invest_helical_F_3D.py \
+python rohlex.py \
   /mnt/.../dynamo_project_b4/abp_align_eo \
   --tomo 1 --twist -1.4 --rise 4.75 --pixelsize 7.92
 
 # RELION 5 (auto-detected from the .star extension)
-python invest_helical_F_3D.py \
+python rohlex.py \
   /mnt/.../warp/relion_b4_clean/particles_new_relion5.star \
   --twist -1.4 --rise 4.75 --out ~/relion_remove_list.txt
 ```

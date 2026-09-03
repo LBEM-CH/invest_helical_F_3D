@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Auto-fit-twist dialog for invest_helical_F_3D.
+Auto-fit-twist dialog for Rohlex.
 
 author: Wen-Lu Chung
 

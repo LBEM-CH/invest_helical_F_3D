@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Marked-for-removal store for invest_helical_F_3D.
+Marked-for-removal store for Rohlex.
 
 author: Wen-Lu Chung
 
@@ -22,11 +22,16 @@ import os
 from PyQt6 import QtCore
 
 # Bumped whenever the pose convention that turns stored angles into a rotation changes
-# (see helix_geom.dynamo_rotation). flipped_list.txt records the resulting angles, which
-# are convention-dependent, so a file written under a different convention can no longer
-# be trusted -- load_flips flags it and the GUI asks the user to regenerate. Same-version
-# files round-trip exactly, so the normal open/flip/close/reopen cycle is unaffected.
-FLIP_CONVENTION = "artiax-zxz-v1"
+# (see helix_geom.dynamo_rotation), OR whenever the flip operation itself changes, since
+# flipped_list.txt records the resulting angles rather than the recipe. A file written
+# under a different version can no longer be trusted -- load_flips flags it and the GUI
+# asks the user to regenerate. Same-version files round-trip exactly, so the normal
+# open/flip/close/reopen cycle is unaffected.
+#   -v2: the tilt (polarity) flip became a per-segment 180 deg turn about the reference's
+#        own x axis (helix_geom.polarity_flip_eulers). v1 tilt angles were built in the
+#        tomogram frame from the filament fit and the GUI twist, so they depend on the
+#        twist that happened to be set when they were written and are not reproducible.
+FLIP_CONVENTION = "artiax-zxz-v2"
 
 
 class SelectionStore(QtCore.QObject):
@@ -176,7 +181,7 @@ class SelectionStore(QtCore.QObject):
         path = path or self.out_path
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
-            fh.write("# invest_helical_F_3D remove list: Dynamo tags (col 1) to remove\n")
+            fh.write("# Rohlex remove list: Dynamo tags (col 1) to remove\n")
             for tag in sorted(self._marked):
                 fh.write(f"{tag}\n")
         os.replace(tmp, path)            # atomic; safe if the app is killed mid-write
@@ -211,7 +216,7 @@ class SelectionStore(QtCore.QObject):
         path = path or self.flip_path
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
-            fh.write("# invest_helical_F_3D flip list.\n")
+            fh.write("# Rohlex flip list.\n")
             fh.write(f"# convention: {FLIP_CONVENTION}\n")
             fh.write("#   tdrot,tilt,narot = resulting Dynamo ZXZ angles (cols 7-9); "
                      "position (cols 24-26) unchanged.\n")

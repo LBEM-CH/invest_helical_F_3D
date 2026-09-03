@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Helical-filament geometry for invest_helical_F_3D.
+Helical-filament geometry for Rohlex.
 
 author: Wen-Lu Chung
 
@@ -141,7 +141,7 @@ def fit_pose(xyz: np.ndarray, eulers: np.ndarray) -> dict:
       polarity : (N,) sign of (particle z-axis . filament axis), +1/-1. Which way
                  each particle points along the axis; a flipped subset (opposite
                  sign) is a polarity (perpendicular-dyad) ambiguity, not a roll
-                 difference -- see invest_helical's flipped-register overlay.
+                 difference -- see Rohlex's flipped-register overlay.
     """
     n, pos = axis_and_pos(xyz)
     order = np.argsort(pos)
@@ -296,77 +296,49 @@ def polarity_dyad_angle(eulers: np.ndarray, flipped: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip((zm / nm) @ (zf / nf), -1.0, 1.0))))
 
 
-def register_flip_rotation(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray,
-                           flipped: np.ndarray, rate: float, phi0_main: float,
-                           phi0_flip: float, halfwidth: float = 25.0):
-    """The rotation S that maps the flipped (pink) register onto the main (black)
-    register, measured from this filament's own data.
+# --- polarity (tilt) flip ------------------------------------------------------
+# Reversing which way a segment points means turning its REFERENCE 180 deg about the
+# reference's own x axis. It is applied on the right -- in the reference's frame --
+# so it consults no filament axis, no position along the filament and no twist:
+# every segment in the dataset gets the identical operation.
+#
+# That independence is the whole point. The previous implementation built the flip in
+# the TOMOGRAM frame, aimed by the filament's fitted axis and phase and by the GUI
+# twist, then conjugated it by the screw at each segment's position. The net effect
+# was a MIRROR of the roll about the model line, so a group's fitted slope came out
+# as (2*rate - slope): any error in the twist landed in the new angles doubled and
+# reversed, and grew toward the filament ends. Measured on the test set, flipping at
+# a twist 0.1 deg/subunit off threw a filament's slope from -1.18 to +3.33 and pushed
+# a third of the flipped segments past the 20 deg auto-exclude threshold. Flipping in
+# the reference frame cannot do that -- nothing filament-shaped enters it.
+#
+# Roll is read by carrying the reference x axis through the pose (roll_about_axis),
+# and a 180 deg turn about x maps x -> x, so the measured roll is EXACTLY unchanged:
+# a flipped segment does not move on the roll-vs-position plot, it only changes which
+# polarity group it belongs to. The pose z axis is exactly negated, so the tilt to the
+# filament axis goes theta -> 180 - theta exactly (verified to 1e-11 deg) -- a flip
+# turns amber into dark and can never push a good segment into the off-axis grey band.
+#
+# What this does NOT do is close the roll offset between the two polarity groups. That
+# offset was measured per filament on the test set and is a different value on every
+# one (+56, +111, +177, -171, +69 ... deg), so there is no single correction to apply
+# and inventing one per filament would be fabricating alignment from a fit the user is
+# using this tool to check. Closing it is the next Dynamo/RELION run's job -- which
+# must therefore search the roll over the full turn, not locally.
 
-    Both registers are de-screwed (the position-dependent helical roll removed)
-    and averaged, S = mean(main) * mean(flipped)^-1. Each group's mean is taken
-    over the segments whose de-screwed roll is near the GIVEN line phase --
-    phi0_main (black) for the main polarity, phi0_flip (pink) for the flipped --
-    so S is anchored to the drawn lines. (Using each polarity's densest cluster
-    instead would misfire when the main polarity has a second, off-register
-    cluster: S would target that cluster, not black.) Empirically S is a ~180 deg
-    rotation about an axis perpendicular to the filament axis (the polarity dyad).
-    Returns a scipy Rotation, or None if a group is empty / phi0_flip is unset.
+_POLARITY_FLIP = Rot.from_rotvec(np.pi * np.array([1.0, 0.0, 0.0]))
+
+
+def polarity_flip_eulers(eulers: np.ndarray) -> np.ndarray:
+    """Reverse which way each segment points -> new raw Dynamo (tdrot, tilt, narot).
+
+    180 deg about the reference's OWN x axis: per segment and self-contained, taking
+    no filament, no position and no rate. Exactly negates the pose z axis (tilt
+    theta -> 180 - theta) and leaves the measured roll untouched. Self-inverse, and
+    it commutes exactly with rot_flip_eulers (that one multiplies on the left).
     """
-    flipped = np.asarray(flipped, bool)
-    if (~flipped).sum() < 1 or flipped.sum() < 1 or not np.isfinite(phi0_flip):
-        return None
-    D = dynamo_rotation(np.asarray(eulers, float))
-    descrew = Rot.from_rotvec((-np.radians(rate * np.asarray(pos, float)))[:, None]
-                              * np.asarray(axis, float)[None, :])
-    Dt = descrew * D                                   # de-screwed orientations
-    roll = roll_about_axis(Dt, axis)                   # de-screwed roll ~ (phi - rate*pos)
-
-    def mean_near(group, center):
-        gi = np.where(group)[0]
-        d = np.abs(((roll[gi] - center + 180.0) % 360.0) - 180.0)
-        keep = gi[d <= halfwidth]
-        return Dt[keep if keep.size else gi].mean()    # fallback: whole group
-
-    S = mean_near(~flipped, phi0_main) * mean_near(flipped, phi0_flip).inv()
-
-    # Snap S to an EXACT 180-deg rotation about an axis PERPENDICULAR to the filament
-    # axis -- the definition of a polarity dyad. Such a rotation maps every pose's tilt
-    # theta -> 180 - theta EXACTLY, so it turns dark<->amber and leaves grey as grey: a
-    # tilt-flip can then NEVER push a good (dark/amber) segment into the off-axis (grey)
-    # band. The raw mean-to-mean S is only ~180/perpendicular (a few deg off), which
-    # leaked ~4% of near-boundary segments into grey (breaking "exclude bad tilt" after
-    # a flip). Keeping the perpendicular DIRECTION of S preserves its pink->black roll
-    # mapping (verified: roll residual unchanged). Only snap when S is predominantly
-    # perpendicular (a genuine dyad); a near-axis relation is left raw (see history).
-    axis = np.asarray(axis, float)
-    rv = np.asarray(S.as_rotvec(), float)
-    perp = rv - (rv @ axis) * axis                     # component orthogonal to the axis
-    perp_norm = np.linalg.norm(perp)
-    if perp_norm > abs(rv @ axis):                     # more perpendicular than parallel
-        S = Rot.from_rotvec(np.pi * perp / perp_norm)  # exact 180 about that perp axis
-    return S
-
-
-def flipped_eulers(eulers: np.ndarray, pos: np.ndarray, axis: np.ndarray,
-                   rate: float, S, to_majority) -> np.ndarray:
-    """Apply the register flip to segments -> new ZXZ-extrinsic eulers (deg).
-
-    For each segment, S (or S^-1) is conjugated by the screw rotation at that
-    segment's position, so the flipped segment lands on the OTHER register at its
-    own position -- only the 3 angles change, the position does not.
-
-      to_majority : per-segment bool. True  -> apply S    (minority -> majority),
-                                       False -> apply S^-1 (majority -> minority).
-    """
-    eulers = np.atleast_2d(np.asarray(eulers, float))
-    pos = np.atleast_1d(np.asarray(pos, float))
-    to_majority = np.atleast_1d(np.asarray(to_majority, bool))
-    D = dynamo_rotation(eulers)
-    descrew = Rot.from_rotvec((-np.radians(rate * pos))[:, None]
-                              * np.asarray(axis, float)[None, :])
-    Sarr = Rot.concatenate([S if t else S.inv() for t in to_majority])
-    Dnew = descrew.inv() * Sarr * descrew * D
-    return rotation_to_dynamo_eulers(Dnew)
+    D = dynamo_rotation(np.atleast_2d(np.asarray(eulers, float)))
+    return rotation_to_dynamo_eulers(D * _POLARITY_FLIP)
 
 
 def rot_flip_eulers(eulers: np.ndarray, axis: np.ndarray) -> np.ndarray:

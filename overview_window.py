@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Overview window for invest_helical_F_3D.
+Overview window for Rohlex.
 
 author: Wen-Lu Chung
 
@@ -20,11 +20,12 @@ from PyQt6 import QtCore, QtWidgets
 
 from dynamo_table import Dataset
 from detail_window import DetailWindow
-from helix_geom import (model_line, register_flip_rotation, flipped_eulers,
-                        rot_flip_eulers, axis_tilt)
+from helix_geom import (polarity_flip_eulers, rot_flip_eulers,
+                        axis_tilt, oriented_axis, TILT_CONE)
 from plot_common import (ModelParams, ParamBar, effective_phi, effective_tilt,
                         tilt_brushes, tilt_off_axis, TILT_ZONE, PLAIN_BTN_QSS,
                         color_button_qss, category_visible_mask,
+                        unwrap_roll, on_branch, unwrapped_phase,
                         CAT_DARK, CAT_BAD, CAT_AMBER)
 from selection_store import SelectionStore
 
@@ -43,7 +44,10 @@ class _MiniPanel:
         self.plot.setMouseEnabled(False, False)        # panels are for glance/click, not zoom
         self.plot.hideButtons()
         self.plot.setMenuEnabled(False)                # no right-click context menu
-        self.plot.setYRange(-180, 180, padding=0)
+        # y auto-ranges: the roll is drawn UNWRAPPED (see plot_common.unwrap_roll), so
+        # its span is the whole turn count of the filament -- ~3500 deg at twist 166,
+        # ~700 at twist 1.4 -- not a fixed (-180, 180].
+        self.plot.enableAutoRange(axis=pg.ViewBox.YAxis)
         self.plot.getAxis("bottom").setStyle(showValues=False)
         self.plot.getAxis("left").setStyle(showValues=False)
         self.scatter = pg.ScatterPlotItem(size=6, pen=pg.mkPen(None))
@@ -60,15 +64,20 @@ class _MiniPanel:
     # off the final position it is that iteration's view of the same filament (same
     # tags and positions, earlier poses). self.fil stays the working-set filament.
     def redraw_model(self, fil, rate, halfspan):
-        """Rescale x to the shared span and redraw the dashed screw (rate-dependent)."""
+        """Rescale x to the shared span and redraw the dashed screw (rate-dependent).
+
+        Against the unwrapped roll the screw is one STRAIGHT line, so two points are
+        the whole curve -- no wrapping, no seam breaks, and readable at any twist.
+        Its phase is fil.phi0 lifted by whole turns onto the data (unwrapped_phase),
+        which leaves the model itself, and so the residual and the colours, unchanged.
+        """
         if halfspan != self._halfspan:
             self._halfspan = halfspan
             self.plot.setXRange(-halfspan, halfspan, padding=0)
         if fil.fittable and np.isfinite(fil.phi0):
-            # _MODEL_PTS, not the 2000-point default: these panels are ~190 px wide,
-            # so a finer curve costs redraw time nobody can see.
-            xx, model = model_line(halfspan, fil.phi0, rate, npts=_MODEL_PTS)
-            self.model_item.setData(xx, model)
+            phi0 = unwrapped_phase(unwrap_roll(fil.phi), fil.pos, rate, fil.phi0)
+            xx = np.array([-halfspan, halfspan])
+            self.model_item.setData(xx, rate * xx + phi0)
         else:
             self.model_item.setData([], [])
 
@@ -78,7 +87,11 @@ class _MiniPanel:
     def restyle(self, fil, store, tilt, show=(True, True, True), use_flips=True):
         marked = np.array([store.is_marked(t) for t in fil.tags], dtype=bool)
         if tilt is not None:
-            phi = effective_phi(fil, store, use_flips)
+            # Unwrap the RAW roll (stable, model-free) and put the effective roll on
+            # the nearest turn of it, rather than unwrapping the effective roll: a
+            # committed flip then moves its own dot only, instead of shifting every
+            # segment after it. tilt_brushes is untouched -- same colours as before.
+            phi = on_branch(effective_phi(fil, store, use_flips), unwrap_roll(fil.phi))
             vis = category_visible_mask(tilt, show)  # hide unchecked dark/amber/bad-tilt
             self.scatter.setData(x=fil.pos[vis], y=phi[vis],
                                  brush=tilt_brushes(tilt[vis], marked[vis]))
@@ -105,7 +118,7 @@ class OverviewWindow(QtWidgets.QMainWindow):
         self.halfspan = ds.pos_halfspan
         self.detail = None
         self.setWindowTitle(
-            f"invest_helical_F_3D — {ds.fmt} tomo {ds.tomo} — {len(ds.filaments)} filaments")
+            f"Rohlex — {ds.fmt} tomo {ds.tomo} — {len(ds.filaments)} filaments")
         self.resize(1500, 850)
 
         splitter = QtWidgets.QSplitter()
@@ -228,8 +241,8 @@ class OverviewWindow(QtWidgets.QMainWindow):
         The point is to WATCH the roll-vs-position slope change as refinement
         proceeds: a RELION helical refinement that applies the symmetry folds the
         accumulated phase, so the line flattens iteration by iteration toward a slope
-        that is an artefact of the search, not the filament (see docs/pose_and_roll.md
-        §8). The measured-slope readout puts a number on that flattening.
+        that is an artefact of the search, not the filament (see docs/README.md §13).
+        The measured-slope readout puts a number on that flattening.
         """
         row = QtWidgets.QHBoxLayout()
         labels = self.ds.iter_labels
@@ -548,11 +561,17 @@ class OverviewWindow(QtWidgets.QMainWindow):
         rate = self.ds.model_rate
         nset = 0
         set_map = {}
+        pointing = np.zeros((2, 3), int)     # [before/after] x [along, back, side]
+        nfil = 0
         for f in self.ds.filaments:
             if not (f.fittable and np.isfinite(f.phi0) and f.axis is not None):
                 continue
-            # tilt colour of every segment (pose z-axis vs the fitted axis).
-            tilt_ang = axis_tilt(f.eulers, f.axis)
+            # tilt colour of every segment (pose z-axis vs the fitted axis). Pin the
+            # axis orientation once so the before/after counts are read against the
+            # SAME reference direction -- a per-call majority vote could swing after
+            # the flip and make the tally meaningless.
+            ax = oriented_axis(f.eulers, f.axis)
+            tilt_ang = axis_tilt(f.eulers, ax, orient=False)
             if which == "rot":
                 # rot still works on the roll registers, restricted to the on-axis
                 # (dark/amber) segments -- off-axis grey ones are irrelevant.
@@ -566,27 +585,42 @@ class OverviewWindow(QtWidgets.QMainWindow):
                 pose, bits = rot_flip_eulers(f.eulers, f.axis), (0, 1)
             else:                                          # tilt: flip AMBER -> dark
                 # Pure polarity view: target the AMBER (antiparallel) segments -- the
-                # minority pointing the wrong way -- and flip them onto the dark
-                # (axis-aligned) majority. No roll / register (magenta-line) criterion
-                # anymore -- tilt colour alone decides.
+                # minority pointing the wrong way -- and reverse each one WHERE IT
+                # STANDS (180 deg about the reference's own x axis). Tilt colour alone
+                # decides; the flip itself reads no fit, no rate and no position, so
+                # the result is identical whatever the twist box says. See
+                # helix_geom.polarity_flip_eulers.
                 target = tilt_ang >= 180.0 - TILT_ZONE
                 if not target.any():
                     continue
-                S = register_flip_rotation(f.eulers, f.pos, f.axis, f.flipped, rate,
-                                           f.phi0, f.phi0_flip)
-                if S is None:
-                    continue
-                # Reverse polarity per segment: S maps the flipped group -> main, S^-1 the
-                # main group -> flipped. to_majority=f.flipped picks the right direction for
-                # each so EVERY targeted (amber) segment ends up axis-aligned (dark).
-                pose = flipped_eulers(f.eulers, f.pos, f.axis, rate, S, f.flipped)
-                bits = (1, 0)
+                pose, bits = polarity_flip_eulers(f.eulers), (1, 0)
+                # 3D pointing tally: the flip exactly negates the pose z axis, so the
+                # targeted segments move from "backwards" to "along" and the sideways
+                # ones are untouched -- counted, not assumed, so the readout stays
+                # honest if the zones are ever retuned apart.
+                after = axis_tilt(pose, ax, orient=False)
+                for k, ang in ((0, tilt_ang), (1, np.where(target, after, tilt_ang))):
+                    pointing[k, 0] += int((ang <= TILT_CONE).sum())
+                    pointing[k, 1] += int((ang >= 180.0 - TILT_CONE).sum())
+                    pointing[k, 2] += int(((ang > TILT_CONE)
+                                           & (ang < 180.0 - TILT_CONE)).sum())
+                nfil += 1
             for i in np.where(target)[0]:
                 t = int(f.tags[i])
                 set_map[int(t)] = (bits[0], bits[1], tuple(pose[i]))
                 nset += 1
         self.store.replace_flips(set_map)
-        self.status.setText(f"{which}-flip all ON: {nset} {which}-zone segments flipped")
+        if which == "rot":
+            self.status.setText(f"rot-flip all ON: {nset} rot-zone segments flipped")
+            return
+        # Report the 3D result, not a roll statistic: the flip's whole job is to make
+        # every segment of a tube point the same way, and the sideways count is what it
+        # provably cannot fix (those are the "exclude bad tilt" candidates).
+        b, a = pointing
+        self.status.setText(
+            f"tilt-flip all ON: {nset} segments reversed across {nfil} filaments  |  "
+            f"pointing along axis {b[0]}→{a[0]}, backwards {b[1]}→{a[1]}, "
+            f"sideways {b[2]} (unchanged — flip cannot fix these)")
 
     def _auto_exclude(self, *_):
         """Mark for removal every segment whose effective (flipped) roll is more than
@@ -642,7 +676,7 @@ class OverviewWindow(QtWidgets.QMainWindow):
         stale = " — ⚠ flipped_list.txt outdated: regenerate flips" if (
             self.store.flip_count() and getattr(self.store, "flips_stale", False)) else ""
         self.setWindowTitle(
-            f"invest_helical_F_3D — {self.ds.fmt} tomo {self.ds.tomo} — "
+            f"Rohlex — {self.ds.fmt} tomo {self.ds.tomo} — "
             f"{len(self.ds.filaments)} filaments — {self.store.count()} marked{stale}")
 
     def _show(self):

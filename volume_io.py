@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reference-map reading for invest_helical_F_3D's 3D view.
+Reference-map reading for Rohlex's 3D view.
 
 author: Wen-Lu Chung
 

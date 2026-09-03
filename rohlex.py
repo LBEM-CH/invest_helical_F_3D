@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-invest_helical_F_3D — interactive triage of helical-filament segments.
+Rohlex — interactive triage of helical-filament segments.
 
 author: Wen-Lu Chung
 
@@ -25,9 +25,9 @@ you feed to your own .tbl / .star cleanup.
 
 Usage:
     # Dynamo (auto-detected from the folder)
-    python invest_helical_F_3D.py /path/to/.../ite_0004/averages [--tomo 1]
+    python rohlex.py /path/to/.../ite_0004/averages [--tomo 1]
     # RELION (auto-detected from the .star extension)
-    python invest_helical_F_3D.py /path/to/particles_relion5.star
+    python rohlex.py /path/to/particles_relion5.star
         [--twist -1.4] [--rise 4.75] [--pixelsize 7.92] [--cols 5]
         [--out remove_list.txt]
 
@@ -39,7 +39,7 @@ from __future__ import annotations
 import sys
 
 if sys.version_info < (3, 9):
-    sys.stderr.write("invest_helical_F_3D requires Python 3.9+ "
+    sys.stderr.write("Rohlex requires Python 3.9+ "
                      "(running {0}.{1}).\n".format(*sys.version_info[:2]))
     sys.exit(1)
 
@@ -164,7 +164,7 @@ def choose_tomogram(path, fmt):
     if len(tomos) == 1:
         return tomos[0]
     item, ok = QtWidgets.QInputDialog.getItem(
-        None, "invest_helical_F_3D", "Tomogram to load:",
+        None, "Rohlex", "Tomogram to load:",
         [str(t) for t in tomos], 0, False)
     if not ok:
         sys.exit(0)

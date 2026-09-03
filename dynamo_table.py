@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dataset loading for invest_helical_F_3D (Dynamo .tbl or RELION .star).
+Dataset loading for Rohlex (Dynamo .tbl or RELION .star).
 
 author: Wen-Lu Chung
 
@@ -9,7 +9,8 @@ cares which format it came from:
 
   Dynamo : concatenate refined_table_ref_001 + ref_002, sort by tag (col 1),
            filter to one tomogram (col 20), group into filaments (col 23).
-           .tbl columns (0-based): tag=0, ZXZ euler=6:9, tomo=19, fil=22, xyz=23:26
+           .tbl columns (0-based): tag=0, shift=3:6, ZXZ euler=6:9, tomo=19,
+           fil=22, xyz=23:26. The position used is xyz + shift (see COL_SHIFT).
   RELION : read one tomogram's particles from a RELION 5 star, group by
            _rlnHelicalTubeID; relion_star converts the poses to the SAME Dynamo
            ZXZ-extrinsic convention before they reach helix_geom.
@@ -41,10 +42,27 @@ MIN_DYAD_DEG = 150.0
 
 # Dynamo .tbl column indices (0-based).
 COL_TAG = 0
+COL_SHIFT = slice(3, 6)
 COL_EULER = slice(6, 9)
 COL_TOMO = 19
 COL_FIL = 22
 COL_XYZ = slice(23, 26)
+
+# A Dynamo particle sits at cols 24-26 (the pick) PLUS cols 4-6 (the refined shift,
+# same tomogram frame, signed) -- that is what dtcrop re-extracts at and what any
+# tbl->star converter writes out. Both parts are needed here, because the pose is
+# refined TOGETHER with the shift: the roll a segment ends up with belongs to the
+# SHIFTED position, so measuring it against the raw pick decouples roll from
+# position and destroys the screw. On the actin test set the shifts average 3.9 px
+# (62 A, ~2.3 rises) and reach 12 px, i.e. >360 deg of roll at 166 deg / 27 A --
+# ignoring them turned twist 166 into noise (roll concentration 0.31 -> 0.51 and
+# the recovered twist -2.7 -> +160 once they are added). Adding them also leaves
+# the filament straighter than the picks alone (perpendicular RMS 5.1 vs 5.3 A;
+# SUBTRACTING them gives 13.2 A, which is how the sign was pinned).
+#
+# This is the opposite of the RELION path, which deliberately drops
+# _rlnOrigin*Angst -- see the note in relion_star.load_particles. Those shifts are
+# in the SUBTOMOGRAM frame and are not tomogram coordinates; Dynamo's are.
 
 
 @dataclass
@@ -74,20 +92,25 @@ class Filament:
     traj_roll: np.ndarray = None  # (n_iter, N) roll per Dynamo iteration, ordered like tags; or None
     traj_iters: list = None     # iteration numbers matching traj_roll rows; or None
     traj_eulers: np.ndarray = None  # (n_iter, N, 3) pose per iteration, ordered like tags; or None
+    traj_pos_px: np.ndarray = None  # (n_iter, N) position along the fixed axis per iteration; or None
 
     @property
     def n(self) -> int:
         return len(self.tags)
 
     def at_iteration(self, k: int, rate: float, pixelsize: float) -> "Filament":
-        """A view of this filament with the poses it had at trajectory row `k`.
+        """A view of this filament with the pose AND position it had at trajectory row `k`.
 
-        Coordinates never move between iterations (only the angles are refined), so
-        tags, xy/xyz, pos_px and the fitted axis are shared unchanged and just the
-        pose-derived arrays are recomputed -- which is what makes stepping through
-        iterations cheap. Returns a shallow copy, so the caller can hand it to any
-        plot/fit helper that takes a Filament; `self` is returned untouched when no
-        trajectory is attached.
+        The pick never moves, but Dynamo refines a SHIFT alongside the angles and the
+        position that matters here is pick + shift (see COL_SHIFT), so a segment does
+        travel along its filament between iterations -- 2 px on average over the first
+        iteration of the actin set, i.e. ~200 deg of roll at 166 deg / 27 A. Both the
+        pose-derived arrays and pos_px are therefore recomputed; everything else (tags,
+        the fitted axis, the head->tail ordering) is shared unchanged, which is what
+        makes stepping through iterations cheap. Positions are projected onto the FINAL
+        axis and centroid so the trail is comparable row to row. Returns a shallow copy,
+        so the caller can hand it to any plot/fit helper that takes a Filament; `self`
+        is returned untouched when no trajectory is attached.
 
         Rows for a tag missing at that iteration are NaN (see _attach_trajectories);
         NaN flows through scipy's Rotation without raising, so such segments simply
@@ -98,6 +121,8 @@ class Filament:
         eul = np.asarray(self.traj_eulers[k], float)
         f = copy.copy(self)
         f.eulers = eul
+        if self.traj_pos_px is not None:
+            f.pos_px = np.asarray(self.traj_pos_px[k], float)
         f.phi = roll_from_eulers(eul, self.axis)
         z = dynamo_rotation(eul).as_matrix()[:, :, 2]
         pol = np.sign(z @ np.asarray(self.axis, float))
@@ -276,23 +301,29 @@ def available_tomograms(path: str) -> list[int]:
     return sorted(int(x) for x in np.unique(par[:, COL_TOMO].astype(float).astype(int)))
 
 
-def _euler_map(tables, tomo_id) -> dict:
-    """tag -> ZXZ euler triple, from a list of .tbl files filtered to one tomogram."""
+def _euler_map(tables, tomo_id) -> tuple[dict, dict]:
+    """(tag -> ZXZ euler triple, tag -> xyz+shift), from .tbl files of one tomogram."""
     par = np.concatenate(
         [np.loadtxt(t, comments="#", dtype=str, ndmin=2) for t in tables], axis=0)
     par = par[par[:, COL_TOMO].astype(float).astype(int) == int(tomo_id)]
-    tags = par[:, COL_TAG].astype(float).astype(int)
-    return dict(zip(tags.tolist(), par[:, COL_EULER].astype(float)))
+    tags = par[:, COL_TAG].astype(float).astype(int).tolist()
+    xyz = par[:, COL_XYZ].astype(float) + par[:, COL_SHIFT].astype(float)
+    return dict(zip(tags, par[:, COL_EULER].astype(float))), dict(zip(tags, xyz))
 
 
-def _fill_trajectories(filaments, labels, maps) -> None:
-    """Attach the per-iteration poses (traj_eulers) and rolls (traj_roll) to every
-    fittable filament. Shared by the Dynamo and RELION paths, which differ only in
-    how they build `maps` -- one {tag: euler triple} per iteration, oldest->newest.
+def _fill_trajectories(filaments, labels, maps, xyz_maps=None) -> None:
+    """Attach the per-iteration poses (traj_eulers), rolls (traj_roll) and positions
+    (traj_pos_px) to every fittable filament. Shared by the Dynamo and RELION paths,
+    which differ only in how they build `maps` -- one {tag: euler triple} per
+    iteration, oldest->newest.
 
-    Rolls are measured about the FIXED final axis: the picking coordinates are
-    identical across iterations, so the axis never moves and the trail is pure roll
-    convergence. Segments missing from an iteration stay NaN in both arrays.
+    Rolls are measured about the FIXED final axis, and `xyz_maps` (optional, one
+    {tag: xyz} per iteration) is projected onto that same axis and centroid, so both
+    halves of the trail are read in one frame and are comparable row to row. Refits
+    per iteration would let the axis wobble and mix that wobble into the trail; the
+    pick-to-pick scatter about the axis is only ~5 A, so a fixed axis costs nothing.
+    Without `xyz_maps` (RELION) the position is held at its final value.
+    Segments missing from an iteration stay NaN in every array.
     """
     nan3 = np.full(3, np.nan)
     for fil in filaments:
@@ -300,38 +331,50 @@ def _fill_trajectories(filaments, labels, maps) -> None:
             continue
         eulers = np.full((len(maps), fil.n, 3), np.nan)
         traj = np.full((len(maps), fil.n), np.nan)
+        pos = np.full((len(maps), fil.n), np.nan)
+        centroid, axis = fil.xyz.mean(0), np.asarray(fil.axis, float)
         for ii, emap in enumerate(maps):
             eul = np.array([emap.get(int(t), nan3) for t in fil.tags])   # (N, 3)
             eulers[ii] = eul
             valid = np.isfinite(eul[:, 0])
             if valid.any():
                 traj[ii, valid] = roll_from_eulers(eul[valid], fil.axis)
+            if xyz_maps is not None:
+                xyz = np.array([xyz_maps[ii].get(int(t), nan3) for t in fil.tags])
+                pos[ii] = (xyz - centroid) @ axis
         # The last row IS the working set every other view shows, so pin it to the
         # loaded poses rather than to the last iteration file -- the two can differ
         # (RELION reads run_data.star, whose row is labelled with the last run_it).
         eulers[-1] = fil.eulers
         traj[-1] = fil.phi
+        pos[-1] = fil.pos_px
         fil.traj_eulers = eulers
         fil.traj_roll = traj
+        fil.traj_pos_px = pos if xyz_maps is not None else None
         fil.traj_iters = labels
 
 
 def _attach_trajectories(filaments, folders, tomo_id) -> None:
     """Dynamo: per-iteration poses from iteration 0 (the starting_values that seeded
     iteration 1) and every refined iteration. Segments are matched by tag."""
-    labels, maps = [], []
+    labels, maps, xyz_maps = [], [], []
+
+    def add(label, tables):
+        emap, xmap = _euler_map(tables, tomo_id)
+        labels.append(label)
+        maps.append(emap)
+        xyz_maps.append(xmap)
+
     # iteration 0: starting_values sit next to the FIRST iteration's averages
     start_dir = os.path.join(os.path.dirname(folders[0][1]), "starting_values")
     start_tbls = [t for t in sorted(glob.glob(
         os.path.join(start_dir, "starting_table_ref_*_ite_*.tbl")))
         if os.path.getsize(t) > 0]
     if start_tbls:
-        labels.append(0)
-        maps.append(_euler_map(start_tbls, tomo_id))
+        add(0, start_tbls)
     for it, d in folders:
-        labels.append(it)
-        maps.append(_euler_map(find_ref_tables(d), tomo_id))
-    _fill_trajectories(filaments, labels, maps)
+        add(it, find_ref_tables(d))
+    _fill_trajectories(filaments, labels, maps, xyz_maps)
 
 
 def _build_dynamo(path: str, tomo, write_temp: bool, trails: bool = False):
@@ -352,7 +395,7 @@ def _build_dynamo(path: str, tomo, write_temp: bool, trails: bool = False):
         filaments.append(_build_filament(
             fid,
             rows[:, COL_TAG].astype(float).astype(int),
-            rows[:, COL_XYZ].astype(float),
+            rows[:, COL_XYZ].astype(float) + rows[:, COL_SHIFT].astype(float),
             rows[:, COL_EULER].astype(float)))
     if trails and len(folders) > 1:              # earlier iterations -> convergence trails
         _attach_trajectories(filaments, folders, tomo_id)
